@@ -9,6 +9,7 @@
 -module(erl_tar2).
 
 -export([table/1, table/2,
+         extract/1, extract/2,
          open/2]).
 
 -include_lib("kernel/include/file.hrl").
@@ -47,12 +48,37 @@
 	 open_mode = [],			% Open mode options.
 	 verbose = false :: boolean()}).	% Verbose on/off.
 
+extract_opts(List) ->
+    extract_opts(List, default_options()).
+
 table_opts(List) ->
     read_opts(List, default_options()).
 
 default_options() ->
     {ok, Cwd} = file:get_cwd(),
     #read_opts{cwd=Cwd}.
+
+%% Parse options for extract.
+
+extract_opts([keep_old_files|Rest], Opts) ->
+    extract_opts(Rest, Opts#read_opts{keep_old_files=true});
+extract_opts([{cwd, Cwd}|Rest], Opts) ->
+    extract_opts(Rest, Opts#read_opts{cwd=Cwd});
+extract_opts([{files, Files}|Rest], Opts) ->
+    Set = ordsets:from_list(Files),
+    extract_opts(Rest, Opts#read_opts{files=Set});
+extract_opts([memory|Rest], Opts) ->
+    extract_opts(Rest, Opts#read_opts{output=memory});
+extract_opts([compressed|Rest], Opts=#read_opts{open_mode=OpenMode}) ->
+    extract_opts(Rest, Opts#read_opts{open_mode=[compressed|OpenMode]});
+extract_opts([cooked|Rest], Opts=#read_opts{open_mode=OpenMode}) ->
+    extract_opts(Rest, Opts#read_opts{open_mode=[cooked|OpenMode]});
+extract_opts([verbose|Rest], Opts) ->
+    extract_opts(Rest, Opts#read_opts{verbose=true});
+extract_opts([Other|Rest], Opts) ->
+    extract_opts(Rest, read_opts([Other], Opts));
+extract_opts([], Opts) ->
+    Opts.
 
 %% Common options for all read operations.
 
@@ -66,6 +92,48 @@ read_opts([_|Rest], Opts) ->
     read_opts(Rest, Opts);
 read_opts([], Opts) ->
     Opts.
+
+
+%% Extracts all files from the tar file Name.
+extract(Name) ->
+    extract(Name, []).
+
+%% Extracts (all) files from the tar file Name.
+%% Options accepted: keep_old_files, {files, ListOfFilesToExtract}, verbose,
+%%		{cwd, AbsoluteDirectory}
+extract(Name, Opts) ->
+    Opts2 = extract_opts(Opts),
+    Acc = if Opts2#read_opts.output =:= memory -> []; true -> ok end,
+    foldl_read(Name, fun extract1/4, Acc, Opts2).
+
+extract1(eof, Reader, _, Acc) when is_list(Acc) ->
+    {ok, lists:reverse(Acc), Reader};
+extract1(eof, Reader, _, Acc) ->
+    {ok, Acc, Reader};
+extract1(Header = #tar_header{name=Name,size=Size}, Reader, Opts, Acc) ->
+    case check_extract(Name, Opts) of
+        true ->
+            case do_read(Reader, Size) of
+                {ok, Reader2, Bin} ->
+                    case write_extracted_element(Header, Bin, Opts) of
+                        ok ->
+                            {ok, Acc, Reader2};
+                        {ok, NameBin} when is_list(Acc) ->
+                            {ok, [NameBin | Acc], Reader2}
+                    end;
+                Err ->
+                    throw(Err)
+            end;
+        false ->
+            {ok, Acc, skip_file(Reader)}
+    end.
+
+%% Checks if the file Name should be extracted.
+
+check_extract(_, #read_opts{files=all}) ->
+    true;
+check_extract(Name, #read_opts{files=Files}) ->
+    ordsets:is_element(Name, Files).
 
 %% Returns a list of names of the files in the tar file Name.
 %% Options accepted: verbose
@@ -1026,6 +1094,96 @@ skip_unread(#sparse_file_reader{handle=Handle,num_bytes=0}) ->
 skip_unread(Reader = #sparse_file_reader{}) ->
     #sparse_file_reader{handle=Handle} = skip_file(Reader),
     {ok, Handle}.
+
+write_extracted_element(#tar_header{name=Name,typeflag=Type},Bin,#read_opts{output=memory}) ->
+    case typeflag(Type) of
+        regular ->
+            {ok, {Name, Bin}};
+        _ ->
+            ok
+    end;
+write_extracted_element(Header=#tar_header{name=Name}, Bin, Opts) ->
+    Name1 = filename:absname(Name, Opts#read_opts.cwd),
+    Created =
+	case typeflag(Header#tar_header.typeflag) of
+	    regular ->
+		write_extracted_file(Name1, Bin, Opts);
+	    directory ->
+		create_extracted_dir(Name1, Opts);
+	    symlink ->
+		create_symlink(Name1, Header#tar_header.linkname, Opts);
+	    Other -> % Ignore.
+		read_verbose(Opts, "x ~ts - unsupported type ~p~n",
+			     [Name, Other]),
+		not_written
+	end,
+    case Created of
+	ok  -> set_extracted_file_info(Name1, Header);
+	not_written -> ok
+    end.
+
+create_extracted_dir(Name, _Opts) ->
+    case file:make_dir(Name) of
+	ok -> ok;
+	{error,enotsup} -> not_written;
+	{error,eexist} -> not_written;
+	{error,enoent} -> make_dirs(Name, dir);
+	{error,Reason} -> throw({error, Reason})
+    end.
+
+create_symlink(Name, Linkname, Opts) ->
+    case file:make_symlink(Linkname, Name) of
+	ok -> ok;
+	{error,enoent} ->
+	    ok = make_dirs(Name, file),
+	    create_symlink(Name, Linkname, Opts);
+	{error,eexist} -> not_written;
+	{error,enotsup} ->
+	    read_verbose(Opts, "x ~ts - symbolic links not supported~n", [Name]),
+	    not_written;
+	{error,Reason} -> throw({error, Reason})
+    end.
+
+write_extracted_file(Name, Bin, Opts) ->
+    Write =
+	case Opts#read_opts.keep_old_files of
+	    true ->
+		case file:read_file_info(Name) of
+		    {ok, _} -> false;
+		    _ -> true
+		end;
+	    false -> true
+	end,
+    case Write of
+	true ->
+	    read_verbose(Opts, "x ~ts~n", [Name]),
+	    write_file(Name, Bin);
+	false ->
+	    read_verbose(Opts, "x ~ts - exists, not created~n", [Name]),
+	    not_written
+    end.
+
+write_file(Name, Bin) ->
+    case file:write_file(Name, Bin) of
+	ok -> ok;
+	{error,enoent} ->
+	    ok = make_dirs(Name, file),
+	    write_file(Name, Bin);
+	{error,Reason} ->
+	    throw({error, Reason})
+    end.
+
+set_extracted_file_info(_, #tar_header{typeflag = symlink}) -> ok;
+set_extracted_file_info(Name, #tar_header{mtime=Mtime,mode=Mode}) ->
+    Info = #file_info{mode=Mode, mtime=Mtime},
+    file:write_file_info(Name, Info).
+
+%% Makes all directories leading up to the file.
+
+make_dirs(Name, file) ->
+	filelib:ensure_dir(Name);
+make_dirs(Name, dir) ->
+	filelib:ensure_dir(filename:join(Name,"*")).
 
 %% Prints the message on if the verbose option is given (for reading).
 read_verbose(#read_opts{verbose=true}, Format, Args) ->
