@@ -9,6 +9,7 @@
 -module(erl_tar2).
 
 -export([table/1, table/2,
+         t/1, tt/1,
          extract/1, extract/2,
          open/2]).
 
@@ -146,6 +147,70 @@ table(Name) ->
 
 table(Name, Opts) ->
     foldl_read(Name, fun table1/4, [], table_opts(Opts)).
+
+
+%% Comments for printing the contents of a tape archive,
+%% meant to be invoked from the shell.
+-spec t(string()) -> ok.
+t(Name) ->
+    case table(Name) of
+	{ok, List} ->
+	    lists:foreach(fun(N) -> ok = io:format("~ts\n", [N]) end, List);
+	Error ->
+	    Error
+    end.
+
+-spec tt(string()) -> ok.
+tt(Name) ->
+    case table(Name, [verbose]) of
+	{ok, List} ->
+	    lists:foreach(fun print_header/1, List);
+	Error ->
+	    Error
+    end.
+
+print_header({Name, Type, Size, Mtime, Mode, Uid, Gid}) ->
+    io:format("~s~s ~4w/~-4w ~7w ~s ~s\n",
+	      [type_to_string(Type), mode_to_string(Mode),
+	       Uid, Gid, Size, time_to_string(Mtime), Name]).
+
+type_to_string(regular) -> "-";
+type_to_string(directory) -> "d";
+type_to_string(link) -> "l";
+type_to_string(symlink) -> "s";
+type_to_string(char) -> "c";
+type_to_string(block) -> "b";
+type_to_string(fifo) -> "f";
+type_to_string(_) -> "?".
+
+mode_to_string(Mode) ->
+    mode_to_string(Mode, "xwrxwrxwr", []).
+
+mode_to_string(Mode, [C|T], Acc) when Mode band 1 =:= 1 ->
+    mode_to_string(Mode bsr 1, T, [C|Acc]);
+mode_to_string(Mode, [_|T], Acc) ->
+    mode_to_string(Mode bsr 1, T, [$-|Acc]);
+mode_to_string(_, [], Acc) ->
+    Acc.
+
+time_to_string({{Y, Mon, Day}, {H, Min, _}}) ->
+    io_lib:format("~s ~2w ~s:~s ~w", [month(Mon), Day, two_d(H), two_d(Min), Y]).
+
+two_d(N) ->
+    tl(integer_to_list(N + 100)).
+
+month(1) -> "Jan";
+month(2) -> "Feb";
+month(3) -> "Mar";
+month(4) -> "Apr";
+month(5) -> "May";
+month(6) -> "Jun";
+month(7) -> "Jul";
+month(8) -> "Aug";
+month(9) -> "Sep";
+month(10) -> "Oct";
+month(11) -> "Nov";
+month(12) -> "Dec".
 
 table1(eof, _Reader, _, Result) ->
     {ok, lists:reverse(Result)};
