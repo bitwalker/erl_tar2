@@ -1,28 +1,68 @@
+%% Options used when adding files to a tar archive.
+-record(add_opts, {
+	 read_info,          % Fun to use for read file/link info.
+	 chunk_size = 0,     % For file reading when sending to sftp. 0=do not chunk
+         verbose = false}).  % Verbose on/off.
+
+%% Options used when reading a tar archive.
+-record(read_opts, {
+          cwd                    :: string(),  % Current working directory.
+          keep_old_files = false :: boolean(), % Owerwrite or not.
+          files = all,                         % Set of files to extract (or all)
+          output = file :: 'file' | 'memory',
+          open_mode = [],                      % Open mode options.
+          verbose = false :: boolean()}).      % Verbose on/off.
+
+-type add_opt() :: dereference |
+                   verbose |
+                   {chunks, pos_integer()}.
+
+-type extract_opt() :: {cwd, string()} |
+                       {files, [string()]} |
+                       compressed |
+                       cooked |
+                       memory |
+                       keep_old_files |
+                       verbose.
+
+-type create_opt() :: compressed |
+                      cooked |
+                      dereference |
+                      verbose.
+
+-type filelist() :: [file:filename() |
+                     {string(), binary()} |
+                     {string(), file:filename()}].
+
+%% The tar header, once fully parsed.
 -record(tar_header, {
-          name :: string(),          % name of header file entry
-          mode :: non_neg_integer(), % permission and mode bits
-          uid :: non_neg_integer(),  % user id of owner
-          gid :: non_neg_integer(),  % group id of owner
-          size = 0 :: non_neg_integer(), % length in bytes
-          mtime :: pos_integer(),    % modified time
-          typeflag :: char(),        % type of header entry
-          linkname :: string(),      % target name of link
-          uname :: string(),         % user name of owner
-          gname :: string(),         % group name of owner
-          devmajor :: pos_integer(), % major number of character or block device
-          devminor :: pos_integer(), % minor number of character or block device
-          atime :: pos_integer(),    % access time
-          ctime :: pos_integer(),    % status change time
-          xattrs = #{} :: map()      % extended attributes
+          name = "" :: string(),                % name of header file entry
+          mode = 8#100644 :: non_neg_integer(), % permission and mode bits
+          uid = 0 :: non_neg_integer(),         % user id of owner
+          gid = 0 :: non_neg_integer(),         % group id of owner
+          size = 0 :: non_neg_integer(),        % length in bytes
+          mtime :: calendar:datetime(),         % modified time
+          typeflag :: char(),                   % type of header entry
+          linkname = "" :: string(),            % target name of link
+          uname = "" :: string(),               % user name of owner
+          gname = "" :: string(),               % group name of owner
+          devmajor = 0 :: pos_integer(),        % major number of character or block device
+          devminor = 0 :: pos_integer(),        % minor number of character or block device
+          atime :: calendar:datetime(),         % access time
+          ctime :: calendar:datetime(),         % status change time
+          xattrs = #{} :: map()                 % extended attributes
          }).
 
+%% Metadata for a sparse file fragment
 -record(sparse_entry, {
          offset = 0 :: non_neg_integer(),
          num_bytes = 0 :: non_neg_integer()}).
+%% Contains metadata about fragments of a sparse file
 -record(sparse_array, {
           entries = [] :: [#sparse_entry{}],
           is_extended = false :: boolean(),
           max_entries = 0 :: non_neg_integer()}).
+%% A subset of tar header fields common to all tar implementations
 -record(header_v7, {
           name :: string(),
           mode :: string(),
@@ -33,6 +73,7 @@
           checksum :: integer(),
           typeflag :: char(),
           linkname :: string()}).
+%% The set of fields specific to GNU tar formatted archives
 -record(header_gnu, {
           header_v7 :: #header_v7{},
           magic :: binary(),
@@ -45,6 +86,7 @@
           ctime :: pos_integer(),
           sparse :: #sparse_array{},
           real_size :: non_neg_integer()}).
+%% The set of fields specific to STAR-formatted archives
 -record(header_star, {
           header_v7 :: #header_v7{},
           magic :: binary(),
@@ -57,6 +99,7 @@
           atime :: pos_integer(),
           ctime :: pos_integer(),
           trailer :: binary()}).
+%% The set of fields specific to USTAR-formatted archives
 -record(header_ustar, {
           header_v7 :: #header_v7{},
           magic :: binary(),
@@ -68,6 +111,43 @@
           prefix :: string()}).
 
 -type header_fields() :: #header_v7{} | #header_gnu{} | #header_star{} | #header_ustar{}.
+
+%% The overall tar reader, it holds the low-level file handle,
+%% it's access, position, and the I/O primitives wrapper.
+-record(reader, {
+          handle :: file:io_device(),
+          access :: read | write | ram,
+          pos = 0 :: non_neg_integer(),
+          func
+         }).
+%% A reader for a regular file within the tar archive,
+%% It tracks it's current state relative to that file.
+-record(reg_file_reader, {
+          handle :: file:io_device(),
+          num_bytes = 0,
+          pos = 0,
+          size = 0
+         }).
+%% A reader for a sparse file within the tar archive,
+%% It tracks it's current state relative to that file.
+-record(sparse_file_reader, {
+          handle :: file:io_device(),
+          num_bytes = 0, % bytes remaining
+          pos = 0, % pos
+          size = 0, % total size of file
+          sparse_map = #sparse_array{}
+         }).
+
+%% Types for the readers
+-type reader_type() :: #reg_file_reader{} | #sparse_file_reader{}.
+-type handle() :: file:io_device() | term().
+
+%% Types for the I/O primitive wrapper functions
+-type write_fun() :: fun((write, {handle(), iodata()}) -> ok | {error, term()}).
+-type close_fun() :: fun((close, handle()) -> ok | {error, term()}).
+-type read_fun() :: fun((read2, {handle(), non_neg_integer()}) -> {ok, string() | binary()} | eof | {error, term()}).
+-type position_fun() :: fun((position, {file:io_device() | term, non_neg_integer()}) -> ok | {error, term()}).
+-type file_op() :: write_fun() | close_fun() | read_fun() | position_fun().
 
 %% These constants (except S_IFMT) are
 %% used to determine what type of device
@@ -179,6 +259,48 @@
 -define(PAX_GNU_SPARSE_MINOR, <<"GNU.sparse.minor">>).
 -define(PAX_GNU_SPARSE_SIZE, <<"GNU.sparse.size">>).
 -define(PAX_GNU_SPARSE_REALSIZE, <<"GNU.sparse.realsize">>).
+
+-define(V7_NAME, 0).
+-define(V7_NAME_LEN, 100).
+-define(V7_MODE, 100).
+-define(V7_MODE_LEN, 8).
+-define(V7_UID, 108).
+-define(V7_UID_LEN, 8).
+-define(V7_GID, 116).
+-define(V7_GID_LEN, 8).
+-define(V7_SIZE, 124).
+-define(V7_SIZE_LEN, 12).
+-define(V7_MTIME, 136).
+-define(V7_MTIME_LEN, 12).
+-define(V7_CHKSUM, 148).
+-define(V7_CHKSUM_LEN, 8).
+-define(V7_TYPE, 156).
+-define(V7_TYPE_LEN, 1).
+-define(V7_LINKNAME, 157).
+-define(V7_LINKNAME_LEN, 100).
+
+-define(STAR_TRAILER, 508).
+-define(STAR_TRAILER_LEN, 4).
+
+-define(USTAR_MAGIC, 257).
+-define(USTAR_MAGIC_LEN, 6).
+-define(USTAR_VERSION, 263).
+-define(USTAR_VERSION_LEN, 2).
+-define(USTAR_UNAME, 265).
+-define(USTAR_UNAME_LEN, 32).
+-define(USTAR_GNAME, 297).
+-define(USTAR_GNAME_LEN, 32).
+-define(USTAR_DEVMAJ, 329).
+-define(USTAR_DEVMAJ_LEN, 8).
+-define(USTAR_DEVMIN, 337).
+-define(USTAR_DEVMIN_LEN, 8).
+-define(USTAR_PREFIX, 345).
+-define(USTAR_PREFIX_LEN, 155).
+
+-define(GNU_MAGIC, 257).
+-define(GNU_MAGIC_LEN, 6).
+-define(GNU_VERSION, 263).
+-define(GNU_VERSION_LEN, 2).
 
 %% ?BLOCK_SIZE of zero-bytes.
 %% Two of these in a row mark the end of an archive.
