@@ -17,15 +17,12 @@ _build:
 	mkdir -p _build
 
 _build/%.beam: %.erl
-	erlc -o _build erl_tar2.erl
+	erlc -o _build erl_tar.erl
+
+shell: ## Shell with erl_tar2 loaded
+	erl -pa _build
 
 clean: ## Test
 	rm -rf _build
 	rm -rf extracted
 	rm -f *_tmp.tar
-
-test: _build ## Test
-	rm -f *_tmp.tar
-	rm -rf extracted
-	erlc -o _build -DTEST erl_tar2.erl
-	erl -noshell -pa _build -eval "eunit:test(erl_tar2, [verbose])." -s init stop

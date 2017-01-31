@@ -18,7 +18,7 @@ The end goal is to get these changes merged into OTP itself.
 # TODO
 
 - [x] Run test suite for erl_tar
-- [ ] Clean up formatting
+- [x] Clean up formatting
   - [x] Try to fit all lines within 80 chars
   - [x] Consistent typespecs
 - [x] Create test suite for erl_tar

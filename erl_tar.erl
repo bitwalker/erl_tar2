@@ -27,13 +27,14 @@
 %%   http://www.freebsd.org/cgi/man.cgi?query=tar&sektion=5
 %%   http://www.gnu.org/software/tar/manual/html_node/Standard.html
 %%   http://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html
--module(erl_tar2).
+-module(erl_tar).
 
 -export([init/3,
          create/2, create/3,
          extract/1, extract/2,
          table/1, table/2, t/1, tt/1,
 	 open/2, close/1,
+         parse_octal/1,
          add/3, add/4,
          format_error/1]).
 
@@ -44,8 +45,8 @@
 -spec format_error(term()) -> string().
 format_error(invalid_tar_checksum) ->
     "Checksum failed";
-format_error({invalid_format, Format}) ->
-    lists:flatten(io_lib:format("Unrecognized tar header format type: ~p", [Format]));
+format_error(bad_header) ->
+    "Unrecognized tar header format";
 format_error({invalid_header, negative_size}) ->
     "Invalid header: negative size";
 format_error(invalid_sparse_header_size) ->
@@ -104,7 +105,7 @@ extract(Name, Opts) ->
     foldl_read(Name, fun extract1/4, Acc, Opts2).
 
 extract1(eof, Reader, _, Acc) when is_list(Acc) ->
-    {ok, lists:reverse(Acc), Reader};
+    {ok, {ok, lists:reverse(Acc)}, Reader};
 extract1(eof, Reader, _, Acc) ->
     {ok, Acc, Reader};
 extract1(Header = #tar_header{name=Name,size=Size}, Reader, Opts, Acc) ->
@@ -442,7 +443,7 @@ add1(Reader = #reader{}, Name, NameInArchive, Opts=#add_opts{read_info=ReadInfo}
 add1(Reader, Bin, NameInArchive, Opts) when is_binary(Bin) ->
     add_verbose(Opts, "a ~ts~n", [NameInArchive]),
     Now = calendar:now_to_local_time(erlang:timestamp()),
-    Info = #tar_header{
+    Header = #tar_header{
               name = NameInArchive,
               size = byte_size(Bin),
               typeflag = ?TYPE_REGULAR,
@@ -450,7 +451,6 @@ add1(Reader, Bin, NameInArchive, Opts) when is_binary(Bin) ->
               mtime = Now,
               ctime = Now,
               mode = 8#100644},
-    Header = build_header(NameInArchive, Info),
     {ok, Reader2} = add_header(Reader, Header, Opts),
     Padding = skip_padding(byte_size(Bin)),
     Data = [Bin, binary:copy(<<0>>, Padding)],
@@ -469,6 +469,7 @@ add_directory(Reader, DirName, NameInArchive, Info, Opts) ->
             add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             case catch add_files(Reader, Files, DirName, NameInArchive, Opts) of
                 ok -> ok;
+                {ok, Reader2} -> {ok, Reader2};
                 {error, {_Name, _Reason}} = Err -> Err;
                 {error, Reason} -> {error, {DirName, Reason}}
             end;
@@ -485,7 +486,7 @@ add_files(Reader, [Name|Rest], Dir, DirInArchive, Opts=#add_opts{read_info=Info}
         {error, Reason} ->
             {error, {FullName, Reason}};
         {ok, Fi = #file_info{type=directory}} ->
-            ok = add_directory(Reader, FullName, NameInArchive, Fi, Opts);
+            add_directory(Reader, FullName, NameInArchive, Fi, Opts);
         {ok, Fi = #file_info{type=symlink}} ->
             add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             {ok, Linkname} = file:read_link(FullName),
@@ -528,7 +529,7 @@ add_header(Reader=#reader{}, Header=#tar_header{}, Opts) ->
     {ok, Iodata} = build_header(Header, Opts),
     do_write(Reader, Iodata).
 
-build_header(Header, Opts) ->
+build_header(Header = #tar_header{}, Opts) ->
     #tar_header{
        name=Name,
        mode=Mode,
@@ -572,7 +573,7 @@ build_header(Header, Opts) ->
                                      UstarName, ?PAX_NONE, #{}),
                     _ = write_string(Block, ?USTAR_PREFIX, ?USTAR_PREFIX_LEN,
                                      UstarPrefix, ?PAX_NONE, #{}),
-                    maps:delete(?PAX_PATH, Pax11);
+                    maps:remove(?PAX_PATH, Pax11);
                 false ->
                     Pax11
             end
@@ -658,14 +659,14 @@ build_pax_entry(Header, PaxAttrs, Opts) ->
 build_pax_file(Keys, PaxAttrs) ->
     build_pax_file(Keys, PaxAttrs, []).
 build_pax_file([], _, Acc) ->
-    iolist_to_binary(Acc);
+    unicode:characters_to_binary(Acc);
 build_pax_file([K|Rest], Attrs, Acc) ->
     V = maps:get(K, Attrs),
     Size = sizeof(K) + sizeof(V) + 3,
     Size2 = sizeof(Size) + Size,
     Key = to_string(K),
     Value = to_string(V),
-    Record = iolist_to_binary(io_lib:format("~B ~ts=~ts\n", [Size2, Key, Value])),
+    Record = unicode:characters_to_binary(io_lib:format("~B ~ts=~ts\n", [Size2, Key, Value])),
     if byte_size(Record) =/= Size2 ->
             Size3 = byte_size(Record),
             Record2 = io_lib:format("~B ~ts=~ts\n", [Size3, Key, Value]),
@@ -711,12 +712,16 @@ split_ustar_path(Path) ->
                             lists:foldl(fun
                               (_, false) ->
                                   false;
+                              (P, {ok, _, nil}) when byte_size(P) > ?USTAR_PREFIX_LEN ->
+                                  false;
                               (P, {ok, _, Acc}) when
                                    (byte_size(P)+byte_size(Acc)) > ?USTAR_PREFIX_LEN ->
                                   false;
+                              (P, {ok, N, nil}) ->
+                                  {ok, N, P};
                               (P, {ok, N, Acc}) ->
                                   {ok, N, <<Acc/binary,$/,P/binary>>}
-                            end, {ok, Name, <<>>}, Parts2)
+                            end, {ok, Name, nil}, Parts2)
                     end
             end
     end.
@@ -782,13 +787,13 @@ zero_pad(Str, Size) ->
 read_block(Reader) ->
     case do_read(Reader, ?BLOCK_SIZE) of
         eof ->
-            throw({error, unexpected_eof});
+            throw({error, eof});
             %eof;
         %% Two zero blocks mark the end of the archive
         {ok, ?ZERO_BLOCK, Reader1} ->
             case do_read(Reader1, ?BLOCK_SIZE) of
                 eof ->
-                    throw({error, unexpected_eof});
+                    throw({error, eof});
                 {ok, ?ZERO_BLOCK, _Reader2} ->
                     eof;
                 {ok, _Block, _Reader2} ->
@@ -965,14 +970,11 @@ unpack_format(Format, V7 = #header_v7{}, Bin, Reader)
                           _ ->
                               {"", H1}
                       end,
-                      if length(Prefix) > 0 ->
-                              Name = H2#tar_header.name,
-                              H2#tar_header{name=Prefix ++ "/" ++ Name};
-                         true ->
-                              H2
-                      end;
+                      Name = H2#tar_header.name,
+                      H2#tar_header{name=safe_join_path(Prefix, Name)};
                  true ->
-                      Header0
+                      Name = Header0#tar_header.name,
+                      Header0#tar_header{name=safe_join_path("", Name)}
               end,
     HeaderOnly = is_header_only_type(Typeflag),
     Header2 = if HeaderOnly ->
@@ -996,6 +998,16 @@ unpack_format(Format, V7 = #header_v7{}, Bin, Reader)
                            },
             {Header2, FileReader}
     end.
+
+safe_join_path([], Name) ->
+    strip_slashes(Name, both);
+safe_join_path(Prefix, []) ->
+    strip_slashes(Prefix, right);
+safe_join_path(Prefix, Name) ->
+    filename:join(strip_slashes(Prefix, right), strip_slashes(Name, both)).
+
+strip_slashes(Str, Direction) ->
+    string:strip(Str, Direction, $/).
 
 new_sparse_file_reader(_Reader, _Sparsemap, RealSize) when RealSize < 0 ->
     throw({error, invalid_sparse_header_size});
@@ -1050,7 +1062,7 @@ parse_sparse_map(#sparse_array{entries=Entries}, Reader, Acc) ->
 % entire header record, treating the checksum bytes to as ASCII spaces
 compute_checksum(<<H1:?V7_CHKSUM/binary,
                    H2:?V7_CHKSUM_LEN/binary,
-                   Rest:257/binary,
+                   Rest:(?BLOCK_SIZE - ?V7_CHKSUM - ?V7_CHKSUM_LEN)/binary,
                    _/binary>>) ->
     C0 = checksum(H1) + (byte_size(H2) * $\s),
     C1 = checksum(Rest),
@@ -1058,7 +1070,7 @@ compute_checksum(<<H1:?V7_CHKSUM/binary,
 
 compute_signed_checksum(<<H1:?V7_CHKSUM/binary,
                           H2:?V7_CHKSUM_LEN/binary,
-                          Rest:257/binary,
+                          Rest:(?BLOCK_SIZE - ?V7_CHKSUM - ?V7_CHKSUM_LEN)/binary,
                           _/binary>>) ->
     C0 = signed_checksum(H1) + (byte_size(H2) * $\s),
     C1 = signed_checksum(Rest),
@@ -1120,7 +1132,8 @@ do_parse_octal(<<>>, <<>>) ->
 do_parse_octal(<<>>, Acc) ->
     case io_lib:fread("~8u", binary:bin_to_list(Acc)) of
         {error, _} = Err -> Err;
-        {ok, [Octal], _} -> Octal
+        {ok, [Octal], []} -> Octal;
+        {ok, _, _} -> throw({error, bad_header})
     end;
 do_parse_octal(<<$\s,Rest/binary>>, Acc) ->
     do_parse_octal(Rest, Acc);
@@ -1143,7 +1156,7 @@ convert_header(Bin, Reader = #reader{pos=Pos})
   when byte_size(Bin) =:= ?BLOCK_SIZE, (Pos rem ?BLOCK_SIZE) =:= 0 ->
     case get_format(Bin) of
         ?FORMAT_UNKNOWN ->
-            throw({error, {invalid_format, ?FORMAT_UNKNOWN}});
+            throw({error, bad_header});
         {ok, Format, V7} ->
             unpack_format(Format, V7, Bin, Reader)
     end;
@@ -1477,13 +1490,13 @@ merge_pax(Header, ExtraHeaders) when is_map(ExtraHeaders) ->
 merge_pax(Header, []) ->
     Header;
 merge_pax(Header, [{?PAX_PATH, Path}|Rest]) ->
-    merge_pax(Header#tar_header{name=Path}, Rest);
+    merge_pax(Header#tar_header{name=unicode:characters_to_list(Path)}, Rest);
 merge_pax(Header, [{?PAX_LINKPATH, LinkPath}|Rest]) ->
-    merge_pax(Header#tar_header{linkname=LinkPath}, Rest);
+    merge_pax(Header#tar_header{linkname=unicode:characters_to_list(LinkPath)}, Rest);
 merge_pax(Header, [{?PAX_GNAME, Gname}|Rest]) ->
-    merge_pax(Header#tar_header{gname=Gname}, Rest);
+    merge_pax(Header#tar_header{gname=unicode:characters_to_list(Gname)}, Rest);
 merge_pax(Header, [{?PAX_UNAME, Uname}|Rest]) ->
-    merge_pax(Header#tar_header{uname=Uname}, Rest);
+    merge_pax(Header#tar_header{uname=unicode:characters_to_list(Uname)}, Rest);
 merge_pax(Header, [{?PAX_UID, Uid}|Rest]) ->
     Uid2 = binary_to_integer(Uid),
     merge_pax(Header#tar_header{uid=Uid2}, Rest);
@@ -1590,13 +1603,18 @@ do_parse_pax(Reader, Bin, Sparsemap, Headers) ->
 parse_pax_record(Bin) when is_binary(Bin) ->
     case binary:split(Bin, [<<$\n>>]) of
         [Record, Residual] ->
-            case binary:split(Record, [<<$\s>>, <<$=>>], [trim_all, global]) of
-                [_Len, AttrName, AttrValue] ->
-                    {AttrName, AttrValue, Residual};
-                _ ->
+            case binary:split(Record, [<<$\s>>], [trim_all]) of
+                [_Len, Record1] ->
+                    case binary:split(Record1, [<<$=>>], [trim_all]) of
+                        [AttrName, AttrValue] ->
+                            {AttrName, AttrValue, Residual};
+                        _Other ->
+                            throw({error, malformed_pax_record})
+                    end;
+                _Other ->
                     throw({error, malformed_pax_record})
             end;
-        _ ->
+        _Other ->
             throw({error, malformed_pax_record})
     end.
 
@@ -1959,34 +1977,3 @@ read_opts([_|Rest], Opts) ->
     read_opts(Rest, Opts);
 read_opts([], Opts) ->
     Opts.
-
--ifdef(TEST).
--include_lib("eunit/include/eunit.hrl").
-
-%% Reads tar archives produced by various implementations
-read_test() ->
-    [?assertMatch({ok, _}, table("test/support/gnu.tar")),
-     ?assertMatch({ok, _}, table("test/support/bsd.tar")),
-     ?assertMatch({ok, _}, table("test/support/erl_tar.tar")),
-     ?assertMatch({ok, _}, table("test/support/erl_tar2.tar"))].
-
-%% Produces a tar archive, extracts it, and verifies that everything
-%% archived was extracted as expected.
-create_test() ->
-    Files = [{"lorem_ipsum.txt", "test/support/lorem_ipsum.txt"},
-             {"lorem_ipsum.link", "test/support/lorem_ipsum.link"},
-             {"testdir", "test/support/testdir"}],
-    {"Create",
-     {setup,
-        fun() -> ok end,
-        fun (_) -> ?cmd("rm -f test_create_tmp.tar") end,
-        fun (_) ->
-            [?assertMatch(ok, create("test_create_tmp.tar", Files)),
-             ?assertMatch({ok, _}, table("test_create_tmp.tar")),
-             ?assertMatch(ok, extract("test_create_tmp.tar", [{cwd, "extracted"}])),
-             ?assertMatch({ok, #file_info{type=regular}}, file:read_link_info("extracted/lorem_ipsum.txt")),
-             ?assertMatch({ok, #file_info{type=symlink}}, file:read_link_info("extracted/lorem_ipsum.link")),
-             ?assertMatch({ok, #file_info{type=regular}}, file:read_link_info("extracted/testdir/foo/.gitignore"))]
-        end}}.
-
--endif.
