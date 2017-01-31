@@ -1,8 +1,29 @@
-%% This module implements extraction/creation of tar archives.
-%% It should handle most of the common tar archive formats, including those
-%% produced by the GNU and BSD tar utilities.
 %%
-%% References:
+%% %CopyrightBegin%
+%%
+%% Copyright Ericsson AB 1997-2016. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%
+%% %CopyrightEnd%
+%%
+%% This module implements extraction/creation of tar archives.
+%% It supports reading most common tar formats, namely V7, STAR,
+%% USTAR, GNU, BSD/libarchive, and PAX. It produces archives in USTAR
+%% format, unless it must use PAX headers, in which case it produces PAX
+%% format.
+%%
+%% The following references where used:
 %%   http://www.freebsd.org/cgi/man.cgi?query=tar&sektion=5
 %%   http://www.gnu.org/software/tar/manual/html_node/Standard.html
 %%   http://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html
@@ -40,7 +61,8 @@ format_error(eof) ->
 format_error(integer_overflow) ->
     "Failed to parse numeric: integer overflow";
 format_error({misaligned_read, Pos}) ->
-    lists:flatten(io_lib:format("Read a block which was misaligned: block_size=~p pos=~p", [?BLOCK_SIZE, Pos]));
+    lists:flatten(io_lib:format("Read a block which was misaligned: block_size=~p pos=~p",
+                                [?BLOCK_SIZE, Pos]));
 format_error(invalid_gnu_1_0_sparsemap) ->
     "Invalid GNU sparse map (version 1.0)";
 format_error({invalid_gnu_0_1_sparsemap, Format}) ->
@@ -52,13 +74,12 @@ format_error(Atom) when is_atom(Atom) ->
 format_error(Term) ->
     lists:flatten(io_lib:format("~tp", [Term])).
 
-%%%================================================================
 %% Initializes a new reader given a custom file handle and I/O wrappers
 -spec init(handle(), file:mode(), file_op()) -> {ok, #reader{}}.
 init(Handle, AccessMode, Fun) when is_function(Fun, 2) ->
     Reader = #reader{handle=Handle,access=AccessMode,func=Fun},
-    {ok, Pos} = do_position(Reader, {cur, 0}),
-    {ok, Reader#reader{pos=Pos}}.
+    {ok, Pos, Reader2} = do_position(Reader, {cur, 0}),
+    {ok, Reader2#reader{pos=Pos}}.
 
 %%%================================================================
 %% Extracts all files from the tar file Name.
@@ -90,12 +111,14 @@ extract1(Header = #tar_header{name=Name,size=Size}, Reader, Opts, Acc) ->
     case check_extract(Name, Opts) of
         true ->
             case do_read(Reader, Size) of
-                {ok, Reader2, Bin} ->
+                {ok, Bin, Reader2} ->
                     case write_extracted_element(Header, Bin, Opts) of
                         ok ->
                             {ok, Acc, Reader2};
                         {ok, NameBin} when is_list(Acc) ->
-                            {ok, [NameBin | Acc], Reader2}
+                            {ok, [NameBin | Acc], Reader2};
+                        {error, _} = Err ->
+                            throw(Err)
                     end;
                 Err ->
                     throw(Err)
@@ -136,12 +159,13 @@ table(Name) ->
 
 %% Returns a list of names of the files in the tar file Name.
 %% Options accepted: compressed, verbose, cooked.
--spec table(string(), [compressed | verbose | cooked]) -> {ok, [tar_entry()]} | {error, term()}.
+-spec table(string(), [compressed | verbose | cooked]) ->
+                   {ok, [tar_entry()]} | {error, term()}.
 table(Name, Opts) ->
     foldl_read(Name, fun table1/4, [], table_opts(Opts)).
 
-table1(eof, _Reader, _, Result) ->
-    {ok, lists:reverse(Result)};
+table1(eof, Reader, _, Result) ->
+    {ok, {ok, lists:reverse(Result)}, Reader};
 table1(Header = #tar_header{}, Reader, #read_opts{verbose=Verbose}, Result) ->
     Attrs = table1_attrs(Header, Verbose),
     Reader2 = skip_file(Reader),
@@ -260,8 +284,8 @@ open1({binary,Bin}, read, _Raw, Opts) ->
     end;
 open1({file, Fd}, read, _Raw, _Opts) ->
     Reader = #reader{handle=Fd,access=read,func=fun file_op/2},
-    {ok, Pos} = do_position(Reader, {cur, 0}),
-    {ok, Reader#reader{pos=Pos}};
+    {ok, Pos, Reader2} = do_position(Reader, {cur, 0}),
+    {ok, Reader2#reader{pos=Pos}};
 open1(Name, Access, Raw, Opts) ->
     case file:open(Name, Raw ++ [binary, Access|Opts]) of
 	{ok, File} ->
@@ -304,8 +328,8 @@ file_op(close, Fd) ->
 close(Reader=#reader{access=read}) ->
     ok = do_close(Reader);
 close(Reader=#reader{access=write}) ->
-    ok = pad_file(Reader),
-    ok = do_close(Reader),
+    {ok, Reader2} = pad_file(Reader),
+    ok = do_close(Reader2),
     ok;
 close(_) ->
     {error, einval}.
@@ -327,7 +351,8 @@ create(Name, FileList) ->
 
 %% Creates a tar archive Name containing the given files.
 %% Accepted options: verbose, compressed, cooked
--spec create(file:filename(), filelist(), [create_opt()]) -> ok | {error, {string(), term()}}.
+-spec create(file:filename(), filelist(), [create_opt()]) ->
+                    ok | {error, {string(), term()}}.
 create(Name, FileList, Options) ->
     Mode = lists:filter(fun(X) -> (X=:=compressed) or (X=:=cooked)
                         end, Options),
@@ -341,7 +366,7 @@ create(Name, FileList, Options) ->
 do_create(TarFile, [], _Opts) ->
     close(TarFile);
 do_create(TarFile, [{NameInArchive, NameOrBin}|Rest], Opts) ->
-    case add(TarFile, NameInArchive, NameOrBin, Opts) of
+    case add(TarFile, NameOrBin, NameInArchive, Opts) of
         ok ->
             do_create(TarFile, Rest, Opts);
         {error, _} = Err ->
@@ -358,7 +383,8 @@ do_create(TarFile, [Name|Rest], Opts) ->
     end.
 
 %% Adds a file to a tape archive.
--spec add(#reader{}, string(), [add_opt()]) -> ok | {error, {string(), term()}}.
+-spec add(#reader{}, string() | {string(), string() | binary()}, [add_opt()]) ->
+                 ok | {error, {string(), term()}}.
 add(Reader, Name, Options) ->
     add(Reader, Name, Name, Options).
 add(Reader=#reader{access=write}, Name, NameInArchive, Options) ->
@@ -380,31 +406,41 @@ add_opts([_|T], Opts) ->
 add_opts([], Opts) ->
     Opts.
 
-add1(Reader = #reader{}, Name, NameInArchive, Opts=#add_opts{read_info=ReadInfo}) when is_list(Name) ->
+add1(Reader = #reader{}, Name, NameInArchive, Opts=#add_opts{read_info=ReadInfo})
+  when is_list(Name) ->
     Res = case ReadInfo(Name) of
         {error, Reason0} ->
             {error, {Name, Reason0}};
         {ok, Fi = #file_info{type=symlink}} ->
-            Header = fileinfo_to_header(NameInArchive, Fi, Name),
+            add_verbose(Opts, "a ~ts~n", [NameInArchive]),
+            {ok, Linkname} = file:read_link(Name),
+            Header = fileinfo_to_header(NameInArchive, Fi, Linkname),
             add_header(Reader, Header, Opts);
         {ok, Fi = #file_info{type=regular}} ->
+            add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             Header = fileinfo_to_header(NameInArchive, Fi, false),
-            ok = add_header(Reader, Header, Opts),
+            {ok, Reader2} = add_header(Reader, Header, Opts),
             {ok, File} = file:open(Name, [read, binary]),
-            {ok, _} = file:copy(File, Reader#reader.handle),
-            ok;
+            FileSize = Header#tar_header.size,
+            {ok, FileSize, Reader3} = do_copy(Reader2, File),
+            Padding = skip_padding(FileSize),
+            Pad = binary:copy(<<0>>, Padding),
+            do_write(Reader3, Pad);
         {ok, Fi = #file_info{type=directory}} ->
             add_directory(Reader, Name, NameInArchive, Fi, Opts);
         {ok, Fi = #file_info{}} ->
+            add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             Header = fileinfo_to_header(NameInArchive, Fi, false),
             add_header(Reader, Header, Opts)
     end,
     case Res of
         ok -> ok;
+        {ok, _Reader} -> ok;
         {error, {_Name, _Reason}} = Err -> Err;
         {error, Reason} -> {error, {Name, Reason}}
     end;
 add1(Reader, Bin, NameInArchive, Opts) when is_binary(Bin) ->
+    add_verbose(Opts, "a ~ts~n", [NameInArchive]),
     Now = calendar:now_to_local_time(erlang:timestamp()),
     Info = #tar_header{
               name = NameInArchive,
@@ -415,21 +451,22 @@ add1(Reader, Bin, NameInArchive, Opts) when is_binary(Bin) ->
               ctime = Now,
               mode = 8#100644},
     Header = build_header(NameInArchive, Info),
-    ok = add_header(Reader, Header, Opts),
+    {ok, Reader2} = add_header(Reader, Header, Opts),
     Padding = skip_padding(byte_size(Bin)),
-    Data = [Bin, lists:duplicate(Padding, 0)],
-    case do_write(Reader, Data) of
-        ok -> ok;
+    Data = [Bin, binary:copy(<<0>>, Padding)],
+    case do_write(Reader2, Data) of
+        {ok, _Reader3} -> ok;
         {error, Reason} -> {error, {NameInArchive, Reason}}
     end.
 
 add_directory(Reader, DirName, NameInArchive, Info, Opts) ->
     case file:list_dir(DirName) of
 	{ok, []} ->
-	    add_verbose(Opts, "a ~ts~n", [DirName]),
+	    add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             Header = fileinfo_to_header(NameInArchive, Info, false),
             add_header(Reader, Header, Opts);
 	{ok, Files} ->
+            add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             case catch add_files(Reader, Files, DirName, NameInArchive, Opts) of
                 ok -> ok;
                 {error, {_Name, _Reason}} = Err -> Err;
@@ -441,42 +478,39 @@ add_directory(Reader, DirName, NameInArchive, Info, Opts) ->
 
 add_files(_Reader, [], _Dir, _DirInArchive, _Opts) ->
     ok;
-add_files(Reader, [Name|Rest], Dir, DirInArchive, Opts=#add_opts{read_info=ReadInfo}) ->
-    FullName = join_path(Dir, Name),
-    NameInArchive = join_path(DirInArchive, Name),
-    Res = case ReadInfo(FullName) of
+add_files(Reader, [Name|Rest], Dir, DirInArchive, Opts=#add_opts{read_info=Info}) ->
+    FullName = filename:join(Dir, Name),
+    NameInArchive = filename:join(DirInArchive, Name),
+    Res = case Info(FullName) of
         {error, Reason} ->
             {error, {FullName, Reason}};
         {ok, Fi = #file_info{type=directory}} ->
-            ok = add_directory(Reader, Name, NameInArchive, Fi, Opts);
+            ok = add_directory(Reader, FullName, NameInArchive, Fi, Opts);
         {ok, Fi = #file_info{type=symlink}} ->
-            Header = fileinfo_to_header(NameInArchive, Fi, FullName),
-            ok = add_header(Reader, Header, Opts);
+            add_verbose(Opts, "a ~ts~n", [NameInArchive]),
+            {ok, Linkname} = file:read_link(FullName),
+            Header = fileinfo_to_header(NameInArchive, Fi, Linkname),
+            add_header(Reader, Header, Opts);
         {ok, Fi = #file_info{type=regular}} ->
+            add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             Header = fileinfo_to_header(NameInArchive, Fi, false),
-            ok = add_header(Reader, Header, Opts),
+            {ok, Reader2} = add_header(Reader, Header, Opts),
             {ok, File} = file:open(FullName, [read,binary]),
-            {ok, _} = file:copy(File, Reader#reader.handle),
-            ok;
+            FileSize = Header#tar_header.size,
+            {ok, FileSize, Reader3} = do_copy(Reader2, File),
+            Padding = skip_padding(FileSize),
+            Pad = binary:copy(<<0>>, Padding),
+            do_write(Reader3, Pad);
         {ok, Fi = #file_info{}} ->
+            add_verbose(Opts, "a ~ts~n", [NameInArchive]),
             Header = fileinfo_to_header(NameInArchive, Fi, false),
-            ok = add_header(Reader, Header, Opts)
+            add_header(Reader, Header, Opts)
     end,
     case Res of
-        {error, _} = Err -> Err;
-        ok -> add_files(Reader, Rest, Dir, DirInArchive, Opts)
+        ok -> add_files(Reader, Rest, Dir, DirInArchive, Opts);
+        {ok, ReaderNext} -> add_files(ReaderNext, Rest, Dir, DirInArchive, Opts);
+        {error, _} = Err -> Err
     end.
-
-join_path([]) ->
-    [];
-join_path(Parts) when is_list(Parts) ->
-    filename:join(Parts).
-join_path([], Name) ->
-    Name;
-join_path(Path, []) ->
-    Path;
-join_path(Path, Name) ->
-    filename:join(Path, Name).
 
 format_string(String, Size) when length(String) > Size ->
     throw({error, {write_string, field_too_long}});
@@ -488,106 +522,70 @@ format_string(String, Size) ->
     end.
 
 format_octal(Octal) ->
-    [Formatted] = io_lib:fwrite("~.8B", [Octal]),
-    Formatted.
-
-% Convert N to binary (GNU tar/STAR extension)
-format_numeric(N, Size) ->
-    case fits_in_base256(Size, N) of
-        true ->
-            encode_base256(Size, N);
-        false ->
-            throw({error, {write_numeric, field_too_long}})
-    end.
-
-%% Determines whether X can be encoded into N bytes
-%% using base-256 encoding. Unlike octal encoding, base-256
-%% does not require that the string ends with a zero-byte.
-%%
-%% When operating in binary form, this assumes strict GNU binary mode,
-%% which means that the first byte can only either be 16#80 or 16#FF.
-%% The first byte is equivalent to the sign bit in two's complement form.
-fits_in_base256(N, X) ->
-    BinBits = (N-1)*8,
-    N >= 9 orelse (X >= (-1 bsl BinBits) andalso (X < (1 bsl BinBits))).
-
-encode_base256(N, X) ->
-    encode_base256(N, X, []).
-encode_base256(0, _, [FormatBit|_] = Acc) ->
-    [(FormatBit bor 16#80) | Acc];
-encode_base256(N, X, Acc) ->
-    encode_base256(N-1,(X bsr 8),[X|Acc]).
-
--define(BILLION, 1000000000).
-%% Start of unix epoch in gregorian nanoseconds
--define(MIN_TIME_NANO, 62167219200000000000000).
-%% Maximum number of gregorian nanoseconds which can be encoded in 11 octal digits
--define(MAX_TIME_NANO, (?MIN_TIME_NANO+(((1 bsl 33)-1)*?BILLION))).
+    iolist_to_binary(io_lib:fwrite("~.8B", [Octal])).
 
 add_header(Reader=#reader{}, Header=#tar_header{}, Opts) ->
     {ok, Iodata} = build_header(Header, Opts),
-    ok = do_write(Reader, Iodata),
-    ok.
+    do_write(Reader, Iodata).
 
-build_header(Header=#tar_header{}, Opts) ->
-    Pax = #{},
+build_header(Header, Opts) ->
+    #tar_header{
+       name=Name,
+       mode=Mode,
+       uid=Uid,
+       gid=Gid,
+       size=Size,
+       typeflag=Type,
+       linkname=Linkname,
+       uname=Uname,
+       gname=Gname,
+       devmajor=Devmaj,
+       devminor=Devmin
+      } = Header,
     {ok, Block} = file:open(?ZERO_BLOCK, [ram,read,write]),
-    Mtime = datetime_to_gregorian_nanoseconds(Header#tar_header.mtime),
-    Mtime2 = if Mtime >= ?MIN_TIME_NANO andalso Mtime =< ?MAX_TIME_NANO ->
-                  gregorian_nanoseconds_to_posix(Mtime);
-                true ->
-                  0
-             end,
-    Name = Header#tar_header.name,
-    Pax2 = header_format_string(Block, ?V7_NAME, ?V7_NAME_LEN, Name, ?PAX_PATH, Pax),
-    Mode = Header#tar_header.mode,
-    ok = header_format_octal(Block, ?V7_MODE, ?V7_MODE_LEN, Mode),
-    Uid = Header#tar_header.uid,
-    {Pax3, UsedBin} = header_format_numeric(Block, ?V7_UID, ?V7_UID_LEN, Uid, ?PAX_UID, Pax2),
-    Gid = Header#tar_header.gid,
-    {Pax4, UsedBin2} = header_format_numeric(Block, ?V7_GID, ?V7_GID_LEN, Gid, ?PAX_GID, Pax3),
-    Size = Header#tar_header.size,
-    {Pax5, UsedBin3} = header_format_numeric(Block, ?V7_SIZE, ?V7_SIZE_LEN, Size, ?PAX_SIZE, Pax4),
-    {Pax6, UsedBin4} = header_format_numeric(Block, ?V7_MTIME, ?V7_MTIME_LEN, Mtime2, ?PAX_NONE, Pax5),
-    Type = Header#tar_header.typeflag,
-    Pax7 = header_format_string(Block, ?V7_TYPE, ?V7_TYPE_LEN, <<Type>>, ?PAX_NONE, Pax6),
-    Linkname = Header#tar_header.linkname,
-    Pax8  = header_format_string(Block, ?V7_LINKNAME, ?V7_LINKNAME_LEN, Linkname, ?PAX_LINKPATH, Pax7),
-    Uname = Header#tar_header.uname,
-    Pax9  = header_format_string(Block, ?USTAR_UNAME, ?USTAR_UNAME_LEN, Uname, ?PAX_UNAME, Pax8),
-    Gname = Header#tar_header.gname,
-    Pax10 = header_format_string(Block, ?USTAR_GNAME, ?USTAR_GNAME_LEN, Gname, ?PAX_GNAME, Pax9),
-    Devmaj = Header#tar_header.devmajor,
-    {Pax11, UsedBin5} = header_format_numeric(Block, ?USTAR_DEVMAJ, ?USTAR_DEVMAJ_LEN, Devmaj, ?PAX_NONE, Pax10),
-    Devmin = Header#tar_header.devminor,
-    {Pax12, UsedBin6} = header_format_numeric(Block, ?USTAR_DEVMIN, ?USTAR_DEVMIN_LEN, Devmin, ?PAX_NONE, Pax11),
+    Mtime = datetime_to_posix(Header#tar_header.mtime),
+    Pax = write_string(Block, ?V7_NAME, ?V7_NAME_LEN, Name, ?PAX_PATH, #{}),
+    ok = write_octal(Block, ?V7_MODE, ?V7_MODE_LEN, Mode),
+    Pax2 = write_numeric(Block, ?V7_UID, ?V7_UID_LEN, Uid, ?PAX_UID, Pax),
+    Pax3 = write_numeric(Block, ?V7_GID, ?V7_GID_LEN, Gid, ?PAX_GID, Pax2),
+    Pax4 = write_numeric(Block, ?V7_SIZE, ?V7_SIZE_LEN, Size, ?PAX_SIZE, Pax3),
+    Pax5 = write_numeric(Block, ?V7_MTIME, ?V7_MTIME_LEN, Mtime, ?PAX_NONE, Pax4),
+    Pax6 = write_string(Block, ?V7_TYPE, ?V7_TYPE_LEN, <<Type>>, ?PAX_NONE, Pax5),
+    Pax7 = write_string(Block, ?V7_LINKNAME, ?V7_LINKNAME_LEN,
+                        Linkname, ?PAX_LINKPATH, Pax6),
+    Pax8 = write_string(Block, ?USTAR_UNAME, ?USTAR_UNAME_LEN,
+                        Uname, ?PAX_UNAME, Pax7),
+    Pax9 = write_string(Block, ?USTAR_GNAME, ?USTAR_GNAME_LEN,
+                        Gname, ?PAX_GNAME, Pax8),
+    Pax10 = write_numeric(Block, ?USTAR_DEVMAJ, ?USTAR_DEVMAJ_LEN,
+                          Devmaj, ?PAX_NONE, Pax9),
+    Pax11 = write_numeric(Block, ?USTAR_DEVMIN, ?USTAR_DEVMIN_LEN,
+                          Devmin, ?PAX_NONE, Pax10),
     % only use ustar header when name is too long
-    Pax13 = case maps:get(?PAX_PATH, Pax12, nil) of
+    Pax12 = case maps:get(?PAX_PATH, Pax11, nil) of
         nil ->
-            Pax12;
+            Pax11;
         PaxPath ->
             case split_ustar_path(PaxPath) of
                 {ok, UstarName, UstarPrefix} ->
-                    _ = header_format_string(Block, ?V7_NAME, ?V7_NAME_LEN, UstarName, ?PAX_NONE, #{}),
-                    _ = header_format_string(Block, ?USTAR_PREFIX, ?USTAR_PREFIX_LEN, UstarPrefix, ?PAX_NONE, #{}),
-                    maps:delete(?PAX_PATH, Pax12);
+                    _ = write_string(Block, ?V7_NAME, ?V7_NAME_LEN,
+                                     UstarName, ?PAX_NONE, #{}),
+                    _ = write_string(Block, ?USTAR_PREFIX, ?USTAR_PREFIX_LEN,
+                                     UstarPrefix, ?PAX_NONE, #{}),
+                    maps:delete(?PAX_PATH, Pax11);
                 false ->
-                    Pax12
+                    Pax11
             end
     end,
-    UsedBinary = lists:all(fun(X) -> X end, [UsedBin,UsedBin2,UsedBin3,UsedBin4,UsedBin5,UsedBin6]),
-    Format = if UsedBinary ->
-                     ?FORMAT_GNU;
-                true ->
-                     ?FORMAT_USTAR
-             end,
     Xattrs = maps:to_list(Header#tar_header.xattrs),
-    Pax14 = lists:foldl(fun ({K,V}, Acc) -> maps:put(<<?PAX_XATTR_STR,K>>, V, Acc) end, Pax13, Xattrs),
-    PaxEntry = case maps:size(Pax14) of
+    Pax13 = lists:foldl(fun ({K,V}, Acc) ->
+                                maps:put(<<?PAX_XATTR_STR,K>>, V, Acc)
+                        end, Pax12, Xattrs),
+    PaxEntry = case maps:size(Pax13) of
         0 -> [];
-        _ -> build_pax_entry(Header, Pax14, Opts)
+        _ -> build_pax_entry(Header, Pax13, Opts)
     end,
-    set_format(Block, Format),
+    set_format(Block, ?FORMAT_USTAR),
     set_checksum(Block),
     {ok,_} = file:position(Block, 0),
     {ok, HeaderBytes} = file:read(Block, ?BLOCK_SIZE),
@@ -625,19 +623,16 @@ set_checksum(Block) ->
     {ok,Bytes} = file:read(Block, ?BLOCK_SIZE),
     Checksum = compute_checksum(iolist_to_binary(Bytes)),
     {ok,_} = file:position(Block, ?V7_CHKSUM),
-    ok = header_format_octal(Block, ?V7_CHKSUM, ?V7_CHKSUM_LEN - 1, Checksum),
-    {ok,_} = file:position(Block, ?V7_CHKSUM-1),
-    ok = file:write(Block, [$\s]),
+    ok = write_octal(Block, ?V7_CHKSUM, ?V7_CHKSUM_LEN, Checksum),
     ok.
 
 build_pax_entry(Header, PaxAttrs, Opts) ->
-    PathParts = filename:split(Header#tar_header.name),
-    Filename = lists:last(PathParts),
-    DirParts = lists:sublist(PathParts, length(PathParts)-1),
-    Dir = join_path(DirParts),
-    Path = join_path([Dir, "PaxHeaders.0", Filename]),
-    AsciiPath = to_ascii(Path),
-    Path2 = if byte_size(AsciiPath) > ?V7_NAME_LEN ->
+    Path = Header#tar_header.name,
+    Filename = filename:basename(Path),
+    Dir = filename:dirname(Path),
+    Path2 = filename:join([Dir, "PaxHeaders.0", Filename]),
+    AsciiPath = to_ascii(Path2),
+    Path3 = if byte_size(AsciiPath) > ?V7_NAME_LEN ->
                     binary_part(AsciiPath, 0, ?V7_NAME_LEN);
                true ->
                     AsciiPath
@@ -646,8 +641,11 @@ build_pax_entry(Header, PaxAttrs, Opts) ->
     SortedKeys = lists:sort(Keys),
     PaxFile = build_pax_file(SortedKeys, PaxAttrs),
     Size = byte_size(PaxFile),
+    Padding = (?BLOCK_SIZE -
+                   (byte_size(PaxFile) rem ?BLOCK_SIZE)) rem ?BLOCK_SIZE,
+    Pad = binary:copy(<<0>>, Padding),
     PaxHeader = #tar_header{
-                   name=Path2,
+                   name=Path3,
                    size=Size,
                    mtime=Header#tar_header.mtime,
                    atime=Header#tar_header.atime,
@@ -655,29 +653,22 @@ build_pax_entry(Header, PaxAttrs, Opts) ->
                    typeflag=?TYPE_X_HEADER
                   },
     {ok, PaxHeaderData} = build_header(PaxHeader, Opts),
-    [PaxHeaderData, PaxFile].
+    [PaxHeaderData, PaxFile, Pad].
 
 build_pax_file(Keys, PaxAttrs) ->
     build_pax_file(Keys, PaxAttrs, []).
 build_pax_file([], _, Acc) ->
-    % align to ?BLOCK_SIZE
-    Bin = iolist_to_binary(Acc),
-    Padding = (?BLOCK_SIZE - (byte_size(Bin) rem ?BLOCK_SIZE)) rem ?BLOCK_SIZE,
-    Pad = binary:copy(<<0>>, Padding),
-    <<Bin/binary,Pad/binary>>;
-    %Size = byte_size(Bin),
-    %Padding = binary:copy(<<0>>, skip_padding(Size)),
-    %<<Bin/binary, Padding/binary>>;
-build_pax_file([Key|Rest], Attrs, Acc) ->
-    Value = maps:get(Key, Attrs),
-    Size = sizeof(Key) + sizeof(Value) + 3,
+    iolist_to_binary(Acc);
+build_pax_file([K|Rest], Attrs, Acc) ->
+    V = maps:get(K, Attrs),
+    Size = sizeof(K) + sizeof(V) + 3,
     Size2 = sizeof(Size) + Size,
-    KeyStr = to_string(Key),
-    ValueStr = to_string(Value),
-    Record = iolist_to_binary(io_lib:format("~B ~ts=~ts\n", [Size, KeyStr, ValueStr])),
+    Key = to_string(K),
+    Value = to_string(V),
+    Record = iolist_to_binary(io_lib:format("~B ~ts=~ts\n", [Size2, Key, Value])),
     if byte_size(Record) =/= Size2 ->
             Size3 = byte_size(Record),
-            Record2 = io_lib:format("~B ~ts=~ts\n", [Size3, KeyStr, ValueStr]),
+            Record2 = io_lib:format("~B ~ts=~ts\n", [Size3, Key, Value]),
             build_pax_file(Rest, Attrs, [Acc, Record2]);
        true ->
             build_pax_file(Rest, Attrs, [Acc, Record])
@@ -720,7 +711,8 @@ split_ustar_path(Path) ->
                             lists:foldl(fun
                               (_, false) ->
                                   false;
-                              (P, {ok, _, Acc}) when (byte_size(P) + byte_size(Acc)) > ?USTAR_PREFIX_LEN ->
+                              (P, {ok, _, Acc}) when
+                                   (byte_size(P)+byte_size(Acc)) > ?USTAR_PREFIX_LEN ->
                                   false;
                               (P, {ok, N, Acc}) ->
                                   {ok, N, <<Acc/binary,$/,P/binary>>}
@@ -729,20 +721,26 @@ split_ustar_path(Path) ->
             end
     end.
 
-datetime_to_gregorian_nanoseconds(DateTime) ->
-    calendar:datetime_to_gregorian_seconds(DateTime) * ?BILLION.
+datetime_to_posix(DateTime) ->
+    Epoch = calendar:datetime_to_gregorian_seconds({{1970,1,1},{0,0,0}}),
+    Secs = calendar:datetime_to_gregorian_seconds(DateTime),
+    case Secs - Epoch of
+        N when N < 0 -> 0;
+        N -> N
+    end.
 
-gregorian_nanoseconds_to_posix(Nano) ->
-    Nano div ?BILLION.
+write_octal(Block, Pos, Size, X) ->
+    Octal = zero_pad(format_octal(X), Size-1),
+    if byte_size(Octal) < Size ->
+            {ok, _} = file:position(Block, Pos),
+            ok = file:write(Block, Octal),
+            {ok, _} = file:position(Block, Pos+Size),
+            ok;
+       true ->
+            throw({error, {write_failed, octal_field_too_long}})
+    end.
 
-header_format_octal(Block, Pos, Size, X) ->
-    Octal = format_octal(X),
-    {ok, _} = file:position(Block, Pos),
-    ok = file:write(Block, Octal),
-    {ok, _} = file:position(Block, Pos+Size),
-    ok.
-
-header_format_string(Block, Pos, Size, Str, PaxAttr, Pax) ->
+write_string(Block, Pos, Size, Str, PaxAttr, Pax) ->
     {ok, _} = file:position(Block, Pos),
     NotAscii = not is_ascii(Str),
     if PaxAttr =/= ?PAX_NONE andalso (length(Str) > Size orelse NotAscii) ->
@@ -755,23 +753,28 @@ header_format_string(Block, Pos, Size, Str, PaxAttr, Pax) ->
             {ok, _} = file:position(Block, Pos+Size),
             Pax
     end.
-header_format_numeric(Block, Pos, Size, X, PaxAttr, Pax) ->
+write_numeric(Block, Pos, Size, X, PaxAttr, Pax) ->
     % attempt octal
-    Octal = format_octal(X),
-    if length(Octal) < Size ->
-            ok = file:write(Block, Octal),
+    Octal = zero_pad(format_octal(X), Size-1),
+    if byte_size(Octal) < Size ->
+            ok = file:write(Block, [Octal, 0]),
             {ok, _} = file:position(Block, Pos+Size),
-            {Pax, false};
+            Pax;
        PaxAttr =/= ?PAX_NONE ->
             Pax2 = maps:put(PaxAttr, X, Pax),
             {ok, _} = file:position(Block, Pos+Size),
-            {Pax2, false};
+            Pax2;
        true ->
-            Formatted = format_numeric(X, Size),
-            ok = file:write(Block, Formatted),
-            {ok, _} = file:position(Block, Pos+Size),
-            {Pax, true}
+            throw({error, {write_failed, numeric_field_too_long}})
     end.
+
+zero_pad(Str, Size) when byte_size(Str) >= Size ->
+    Str;
+zero_pad(Str, Size) ->
+    Padding = Size - byte_size(Str),
+    Pad = binary:copy(<<$0>>, Padding),
+    <<Pad/binary, Str/binary>>.
+
 
 %%%================================================================
 %% Functions for creating or modifying tar archives
@@ -779,22 +782,23 @@ header_format_numeric(Block, Pos, Size, X, PaxAttr, Pax) ->
 read_block(Reader) ->
     case do_read(Reader, ?BLOCK_SIZE) of
         eof ->
-            eof;
+            throw({error, unexpected_eof});
+            %eof;
         %% Two zero blocks mark the end of the archive
-        {ok, Reader1, ?ZERO_BLOCK} ->
+        {ok, ?ZERO_BLOCK, Reader1} ->
             case do_read(Reader1, ?BLOCK_SIZE) of
                 eof ->
+                    throw({error, unexpected_eof});
+                {ok, ?ZERO_BLOCK, _Reader2} ->
                     eof;
-                {ok, _Reader2, ?ZERO_BLOCK} ->
-                    eof;
-                {ok, _Reader2, _Block} ->
+                {ok, _Block, _Reader2} ->
                     throw({error, invalid_end_of_archive});
                 {error,_} = Err ->
                     throw(Err)
             end;
-        {ok, Reader1, Block} when is_binary(Block) ->
+        {ok, Block, Reader1} when is_binary(Block) ->
             {ok, Block, Reader1};
-        {error,_} = Err ->
+        {error, _} = Err ->
             throw(Err)
     end.
 
@@ -820,7 +824,8 @@ to_v7(Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
        linkname=binary_part(Bin, ?V7_LINKNAME, ?V7_LINKNAME_LEN)
       }.
 
-to_gnu(V7=#header_v7{}, Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
+to_gnu(V7=#header_v7{}, Bin)
+  when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
     #header_gnu{
        header_v7=V7,
        magic=binary_part(Bin, ?GNU_MAGIC, ?GNU_MAGIC_LEN),
@@ -835,7 +840,8 @@ to_gnu(V7=#header_v7{}, Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE
        real_size=binary_part(Bin, 483, 12)
       }.
 
-to_star(V7=#header_v7{}, Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
+to_star(V7=#header_v7{}, Bin)
+  when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
     #header_star{
        header_v7=V7,
        magic=binary_part(Bin, ?USTAR_MAGIC, ?USTAR_MAGIC_LEN),
@@ -850,7 +856,8 @@ to_star(V7=#header_v7{}, Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZ
        trailer=binary_part(Bin, ?STAR_TRAILER, ?STAR_TRAILER_LEN)
       }.
 
-to_ustar(V7=#header_v7{}, Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
+to_ustar(V7=#header_v7{}, Bin)
+  when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
     #header_ustar{
        header_v7=V7,
        magic=binary_part(Bin, ?USTAR_MAGIC, ?USTAR_MAGIC_LEN),
@@ -865,7 +872,8 @@ to_ustar(V7=#header_v7{}, Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SI
 to_sparse_array(Bin) when is_binary(Bin) ->
     MaxEntries = trunc(byte_size(Bin) / 24),
     IsExtended = not (<<0>> == binary_part(Bin, 24*MaxEntries, 1)),
-    Entries = [to_sparse_entry(binary_part(Bin, N, 24)) || N <- lists:seq(0, MaxEntries-1)],
+    Entries = [to_sparse_entry(binary_part(Bin, N, 24)) ||
+                  N <- lists:seq(0, MaxEntries-1)],
     #sparse_array{
        entries=Entries,
        max_entries=MaxEntries,
@@ -911,7 +919,8 @@ get_format(Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
             {ok, Format, V7}
      end.
 
-unpack_format(Format, V7 = #header_v7{}, Bin, Reader) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
+unpack_format(Format, V7 = #header_v7{}, Bin, Reader)
+  when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
     Header0 = #tar_header{
                  name=parse_string(V7#header_v7.name),
                  mode=parse_numeric(V7#header_v7.mode),
@@ -928,10 +937,13 @@ unpack_format(Format, V7 = #header_v7{}, Bin, Reader) when is_binary(Bin), byte_
                       H0 = Header0#tar_header{
                         uname=parse_string(Ustar#header_ustar.uname),
                         gname=parse_string(Ustar#header_ustar.gname)},
-                      H1 = if Typeflag =:= ?TYPE_CHAR orelse Typeflag =:= ?TYPE_BLOCK ->
+                      H1 = if Typeflag =:= ?TYPE_CHAR
+                              orelse Typeflag =:= ?TYPE_BLOCK ->
+                                   Ma = parse_numeric(Ustar#header_ustar.devmajor),
+                                   Mi = parse_numeric(Ustar#header_ustar.devminor),
                                    H0#tar_header{
-                                     devmajor=parse_numeric(Ustar#header_ustar.devmajor),
-                                     devminor=parse_numeric(Ustar#header_ustar.devminor)
+                                     devmajor=Ma,
+                                     devminor=Mi
                                     };
                               true ->
                                    H0
@@ -942,9 +954,13 @@ unpack_format(Format, V7 = #header_v7{}, Bin, Reader) when is_binary(Bin), byte_
                           ?FORMAT_STAR ->
                               Star = to_star(V7, Bin),
                               Prefix0=parse_string(Star#header_star.prefix),
+                              Atime0 = Star#header_star.atime,
+                              Atime =posix_to_erlang_time(parse_numeric(Atime0)),
+                              Ctime0 = Star#header_star.ctime,
+                              Ctime =posix_to_erlang_time(parse_numeric(Ctime0)),
                               {Prefix0, H1#tar_header{
-                                atime=posix_to_erlang_time(parse_numeric(Star#header_star.atime)),
-                                ctime=posix_to_erlang_time(parse_numeric(Star#header_star.ctime))
+                                atime=Atime,
+                                ctime=Ctime
                                }};
                           _ ->
                               {"", H1}
@@ -1014,7 +1030,8 @@ validate_sparse_entries([Entry=#sparse_entry{}|Rest], RealSize, I, LastOffset) -
     validate_sparse_entries(Rest, RealSize, I+1, Offset+NumBytes).
 
 
-parse_sparse_map(Gnu=#header_gnu{sparse=Sparse}, Reader) when Sparse#sparse_array.is_extended ->
+parse_sparse_map(Gnu=#header_gnu{sparse=Sparse}, Reader)
+  when Sparse#sparse_array.is_extended ->
     parse_sparse_map(Gnu, Reader, []);
 parse_sparse_map(#header_gnu{sparse=Sparse}, Reader) ->
     {Sparse#sparse_array.entries, Reader}.
@@ -1029,20 +1046,20 @@ parse_sparse_map(#sparse_array{is_extended=true,entries=Entries}, Reader, Acc) -
 parse_sparse_map(#sparse_array{entries=Entries}, Reader, Acc) ->
     {Entries ++ Acc, Reader}.
 
--define(CHECKSUM_OFFSET, 148).
--define(CHECKSUM_FIELD_LEN, 8).
-% Defined by taking the sum of the unsigned byte values of the entire header record,
-% rewriting the checksum bytes to be ASCII spaces, It is stored as a 6-digit octal
-% number with leading zeroes followed by a zero-byte and then a space. Some implementations
-% do not adhere to this format. For compatibility, ignore the leading and trailing whitespace,
-% and take the first six digits. Some older implementations treated bytes as signed, so we
-% calculate both checksums and check against both, if one succeeds, we're good.
-compute_checksum(<<H1:?CHECKSUM_OFFSET/binary,H2:?CHECKSUM_FIELD_LEN/binary,Rest:257/binary,_/binary>>) ->
+% Defined by taking the sum of the unsigned byte values of the
+% entire header record, treating the checksum bytes to as ASCII spaces
+compute_checksum(<<H1:?V7_CHKSUM/binary,
+                   H2:?V7_CHKSUM_LEN/binary,
+                   Rest:257/binary,
+                   _/binary>>) ->
     C0 = checksum(H1) + (byte_size(H2) * $\s),
     C1 = checksum(Rest),
     C0 + C1.
 
-compute_signed_checksum(<<H1:?CHECKSUM_OFFSET/binary,H2:?CHECKSUM_FIELD_LEN/binary,Rest:257/binary,_/binary>>) ->
+compute_signed_checksum(<<H1:?V7_CHKSUM/binary,
+                          H2:?V7_CHKSUM_LEN/binary,
+                          Rest:257/binary,
+                          _/binary>>) ->
     C0 = signed_checksum(H1) + (byte_size(H2) * $\s),
     C1 = signed_checksum(Rest),
     C0 + C1.
@@ -1122,7 +1139,8 @@ do_parse_string(<<C, Rest/binary>>, Acc) ->
     do_parse_string(Rest, <<Acc/binary, C>>).
 
 
-convert_header(Bin, Reader) when byte_size(Bin) =:= ?BLOCK_SIZE, (Reader#reader.pos rem ?BLOCK_SIZE) =:= 0 ->
+convert_header(Bin, Reader = #reader{pos=Pos})
+  when byte_size(Bin) =:= ?BLOCK_SIZE, (Pos rem ?BLOCK_SIZE) =:= 0 ->
     case get_format(Bin) of
         ?FORMAT_UNKNOWN ->
             throw({error, {invalid_format, ?FORMAT_UNKNOWN}});
@@ -1140,7 +1158,8 @@ convert_header(_Bin, _Reader) ->
 %% on the provided file_info record. If the file is
 %% a symlink, then `link` is used as the link target.
 %% If the file is a directory, a slash is appended to the name.
--spec fileinfo_to_header(string(), #file_info{}, string()) -> #tar_header{} | {error, term()}.
+-spec fileinfo_to_header(string(), #file_info{}, string()) ->
+                                #tar_header{} | {error, term()}.
 fileinfo_to_header(Name, Fi = #file_info{}, Link) ->
     BaseHeader = #tar_header{name=Name,
                          mtime=Fi#file_info.mtime,
@@ -1153,7 +1172,8 @@ fileinfo_to_header(Name, Fi = #file_info{}, Link) ->
 
 do_fileinfo_to_header(Header, #file_info{size=Size,type=regular}, _Link) ->
     Header#tar_header{size=Size,typeflag=?TYPE_REGULAR};
-do_fileinfo_to_header(Header = #tar_header{name=Name}, #file_info{type=directory}, _Link) ->
+do_fileinfo_to_header(Header = #tar_header{name=Name},
+                      #file_info{type=directory}, _Link) ->
     Header#tar_header{name=Name++"/",typeflag=?TYPE_DIR};
 do_fileinfo_to_header(Header, #file_info{type=symlink}, Link) ->
     Header#tar_header{typeflag=?TYPE_SYMLINK,linkname=Link};
@@ -1200,9 +1220,6 @@ to_ascii(<<C, Rest/binary>>, Acc) when C < 16#80 ->
 to_ascii(<<_, Rest/binary>>, Acc) ->
     to_ascii(Rest, Acc).
 
-
-
-
 is_header_only_type(?TYPE_SYMLINK) -> true;
 is_header_only_type(?TYPE_LINK)    -> true;
 is_header_only_type(?TYPE_CHAR)    -> true;
@@ -1210,11 +1227,6 @@ is_header_only_type(?TYPE_BLOCK)   -> true;
 is_header_only_type(?TYPE_DIR)     -> true;
 is_header_only_type(?TYPE_FIFO)    -> true;
 is_header_only_type(_) -> false.
-
-erlang_time_to_posix(Datetime) ->
-    EpochSeconds = calendar:datetime_to_gregorian_seconds({{1970,1,1},{0,0,0}}),
-    Seconds = calendar:datetime_to_gregorian_seconds(Datetime),
-    Seconds - EpochSeconds.
 
 posix_to_erlang_time(Sec) ->
     OneMillion = 1000000,
@@ -1232,8 +1244,8 @@ foldl_read(TarName, Fun, Accu, Opts) ->
                 {ok, Result, Reader2} ->
                     ok = do_close(Reader2),
                     Result;
-                 Other ->
-                    Other
+                 {error, _} = Err ->
+                    Err
             end;
 	Error ->
 	    Error
@@ -1265,15 +1277,17 @@ foldl_read1(Fun, Accu0, Reader, Opts, ExtraHeaders) ->
                     foldl_read1(Fun, Accu0, Reader3, Opts, ExtraHeaders3);
                 ?TYPE_GNU_LONGNAME ->
                     {RealName, Reader3} = get_real_name(Reader2),
-                    ExtraHeaders2 = maps:put(?PAX_PATH, parse_string(RealName), ExtraHeaders),
+                    ExtraHeaders2 = maps:put(?PAX_PATH,
+                                             parse_string(RealName), ExtraHeaders),
                     foldl_read1(Fun, Accu0, Reader3, Opts, ExtraHeaders2);
                 ?TYPE_GNU_LONGLINK ->
                     {RealName, Reader3} = get_real_name(Reader2),
-                    ExtraHeaders2 = maps:put(?PAX_LINKPATH, parse_string(RealName), ExtraHeaders),
+                    ExtraHeaders2 = maps:put(?PAX_LINKPATH,
+                                             parse_string(RealName), ExtraHeaders),
                     foldl_read1(Fun, Accu0, Reader3, Opts, ExtraHeaders2);
                 _ ->
                     Header1 = merge_pax(Header, ExtraHeaders),
-                    {Reader3, Header2} = get_file_reader(Reader2, Header1, ExtraHeaders),
+                    {Reader3,Header2} = get_file_reader(Reader2,Header1,ExtraHeaders),
                     {ok, NewAccu, Reader4} = Fun(Header2, Reader3, Opts, Accu0),
                     foldl_read1(Fun, NewAccu, Reader4, Opts, #{})
                 end
@@ -1282,10 +1296,12 @@ foldl_read1(Fun, Accu0, Reader, Opts, ExtraHeaders) ->
 % Checks for PAX format sparse headers and uses a
 % sparse_file_reader if this is a PAX format sparse file, otherwise it
 % uses the plain reader.
-get_file_reader(Reader, Header, #{?PAX_GNU_SPARSE_MAJOR:=Major,?PAX_GNU_SPARSE_MINOR:=Minor} = Extra) ->
+get_file_reader(Reader, Header,
+      #{?PAX_GNU_SPARSE_MAJOR:=Major,?PAX_GNU_SPARSE_MINOR:=Minor} = Extra) ->
     SparseFormat = <<Major/binary,$.,Minor/binary>>,
     do_get_file_reader(Reader, Header, SparseFormat, Extra);
-get_file_reader(Reader, Header, #{?PAX_GNU_SPARSE_NAME:=_SparseName,?PAX_GNU_SPARSE_MAP:=_SparseMap} = Extra) ->
+get_file_reader(Reader, Header,
+      #{?PAX_GNU_SPARSE_NAME:=_SparseName,?PAX_GNU_SPARSE_MAP:=_SparseMap}=Extra) ->
     SparseFormat = <<"0.1">>,
     do_get_file_reader(Reader, Header, SparseFormat, Extra);
 get_file_reader(Reader, Header, #{?PAX_GNU_SPARSE_SIZE:=_SparseSize} = Extra) ->
@@ -1293,9 +1309,9 @@ get_file_reader(Reader, Header, #{?PAX_GNU_SPARSE_SIZE:=_SparseSize} = Extra) ->
     do_get_file_reader(Reader, Header, SparseFormat, Extra);
 get_file_reader(Reader, Header, _ExtraHeaders) ->
     do_get_file_reader(Reader, Header, false, false).
-do_get_file_reader(Reader = #reg_file_reader{}, Header, false, false) ->
+do_get_file_reader(Reader=#reg_file_reader{}, Header, false, false) ->
     {Reader, Header};
-do_get_file_reader(Reader = #sparse_file_reader{handle=Reader}, Header, false, false) ->
+do_get_file_reader(Reader=#sparse_file_reader{handle=Reader}, Header,false,false) ->
     % unknown sparse format, so treat as a regular file
     NumBytes = Reader#sparse_file_reader.num_bytes,
     Size = Reader#sparse_file_reader.size,
@@ -1332,14 +1348,17 @@ read_gnu_sparsemap_1_0(Reader) ->
         {ok, Reader2, Bin} ->
             case binary:split(Bin, [<<$\n>>]) of
                 [Token,Bin2] ->
-                    NumEntries = binary_to_integer(Token),
-                    if NumEntries < 0 -> throw({error, invalid_gnu_1_0_sparsemap});
-                       true -> ok
+                    NEntries = binary_to_integer(Token),
+                    if NEntries < 0 ->
+                            throw({error, invalid_gnu_1_0_sparsemap});
+                       true ->
+                            ok
                     end,
                     % parse all member entries
-                    case feed_tokens(Reader2, 2*NumEntries) of
+                    case feed_tokens(Reader2, 2*NEntries) of
                         {ok, Reader3, Bin3} ->
-                            read_gnu_sparsemap_1_0_entries(Reader3, NumEntries, <<Bin2/binary,Bin3/binary>>);
+                            Bin4 = <<Bin2/binary,Bin3/binary>>,
+                            read_gnu_sparsemap_1_0_entries(Reader3, NEntries, Bin4);
                         _ ->
                             throw({error, invalid_gnu_1_0_sparsemap})
                     end;
@@ -1351,7 +1370,8 @@ read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin) ->
     read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin, #sparse_array{}).
 read_gnu_sparsemap_1_0_entries(Reader, 0, _Bin, Acc) ->
     {Acc, Reader};
-read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin, Acc=#sparse_array{entries=Entries}) ->
+read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin,
+                               Acc=#sparse_array{entries=Entries}) ->
     case binary:split(Bin, [<<$\n>>]) of
         [OffsetToken, Bin2] ->
             case binary:split(Bin2, [<<$\n>>]) of
@@ -1360,7 +1380,7 @@ read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin, Acc=#sparse_array{entrie
                     NumBytes = binary_to_integer(NumBytesToken),
                     Entry = #sparse_entry{offset=Offset,num_bytes=NumBytes},
                     Acc2 = Acc#sparse_array{entries=[Entry|Entries]},
-                    read_gnu_sparsemap_1_0_entries(Reader, NumEntries-1, Bin3, Acc2);
+                    read_gnu_sparsemap_1_0_entries(Reader, NumEntries-1,Bin3,Acc2);
                 _ ->
                     throw({error, invalid_gnu_1_0_sparsemap})
             end;
@@ -1378,7 +1398,7 @@ feed_tokens(Reader, 0, Buffer) ->
     {Reader, Buffer};
 feed_tokens(Reader, Count, Buffer) ->
     case do_read(Reader, ?BLOCK_SIZE) of
-        {ok, Reader2, Bin} ->
+        {ok, Bin, Reader2} ->
             Buffer2 = <<Buffer/binary,Bin/binary>>,
             Newlines = count_newlines(Buffer2),
             feed_tokens(Reader2, Count-Newlines, Buffer2);
@@ -1399,7 +1419,8 @@ count_newlines(<<_C, Bin/binary>>, Count) ->
 %% Reads the sparse map as stored in GNU's PAX sparse format version 0.1.
 %% The sparse map is stored in the PAX headers.
 -spec read_gnu_sparsemap_0_1(map(), binary()) -> #sparse_array{}.
-read_gnu_sparsemap_0_1(#{?PAX_GNU_SPARSE_NUMBLOCKS:=NumEntriesStr,?PAX_GNU_SPARSE_MAP:=SparseMap}, Format) ->
+read_gnu_sparsemap_0_1(#{?PAX_GNU_SPARSE_NUMBLOCKS:=NumEntriesStr,
+                         ?PAX_GNU_SPARSE_MAP:=SparseMap}, Format) ->
     NumEntries = binary_to_integer(NumEntriesStr),
     if NumEntries < 0 orelse (2*NumEntries) < NumEntries ->
        throw({error, {malformed_gnu_0_1_sparsemap, Format}});
@@ -1495,7 +1516,8 @@ parse_pax_time(Bin) when is_binary(Bin) ->
             Seconds = binary_to_integer(SecondsStr),
             if byte_size(NanoStr) < ?MAX_NANO_INT_SIZE ->
                     % right pad
-                    Padding = binary:list_to_bin(lists:duplicate(?MAX_NANO_INT_SIZE-byte_size(NanoStr), 0)),
+                    PaddingN = ?MAX_NANO_INT_SIZE-byte_size(NanoStr),
+                    Padding = binary:copy(<<0>>, PaddingN),
                     NanoStr2 = <<NanoStr/binary,Padding/binary>>,
                     Nano = binary_to_integer(NanoStr2),
                     (Seconds*?BILLION)+Nano;
@@ -1519,12 +1541,13 @@ parse_pax_time(Bin) when is_binary(Bin) ->
 
 %% Given a sparse or regular file reader, reads the whole file and
 %% parses all extended attributes it contains.
--spec parse_pax(#sparse_file_reader{} | #reg_file_reader{}) -> {#tar_header{}, #reader{}}.
+-spec parse_pax(#sparse_file_reader{} | #reg_file_reader{}) ->
+                       {#tar_header{}, #reader{}}.
 parse_pax(#sparse_file_reader{handle=Handle,num_bytes=0}) ->
     {#{}, Handle};
 parse_pax(#sparse_file_reader{handle=Handle,num_bytes=NumBytes}) ->
     case do_read(Handle, NumBytes) of
-        {ok, Handle2, Bytes} ->
+        {ok, Bytes, Handle2} ->
             % for GNU PAX sparse format 0.0 support
             % this function transforms the sparse format 0.0 headers
             % into sparse format 0.1 headers
@@ -1536,7 +1559,7 @@ parse_pax(#reg_file_reader{handle=Handle,num_bytes=0}) ->
     {#{}, Handle};
 parse_pax(#reg_file_reader{handle=Handle,num_bytes=NumBytes}) ->
     case do_read(Handle, NumBytes) of
-        {ok, Handle2, Bytes} ->
+        {ok, Bytes, Handle2} ->
             % for GNU PAX sparse format 0.0 support
             % this function transforms the sparse format 0.0 headers
             % into sparse format 0.1 headers
@@ -1556,7 +1579,8 @@ do_parse_pax(Reader, Bin, Sparsemap, Headers) ->
     {Key, Value, Residual} = parse_pax_record(Bin),
     if Key =:= ?PAX_GNU_SPARSE_OFFSET orelse Key =:= ?PAX_GNU_SPARSE_NUMBYTES ->
         % GNU sparse format 0.0 special key, write to sparse map instead of headers map
-        do_parse_pax(Reader, Residual, <<Sparsemap/binary, Value/binary, $,>>, Headers);
+        Sparsemap2 = <<Sparsemap/binary,Value/binary,$,>>,
+        do_parse_pax(Reader, Residual, Sparsemap2, Headers);
        true ->
         NewHeaders = maps:put(Key, Value, Headers),
         do_parse_pax(Reader, Residual, Sparsemap, NewHeaders)
@@ -1580,14 +1604,14 @@ get_real_name(#reg_file_reader{handle=Handle,num_bytes=0}) ->
     {"", Handle};
 get_real_name(#reg_file_reader{handle=Handle,num_bytes=NumBytes}) ->
     case do_read(Handle, NumBytes) of
-        {ok, Handle2, RealName} ->
+        {ok, RealName, Handle2} ->
             {RealName, Handle2};
         {error, _} = Err ->
             throw(Err)
     end;
 get_real_name(Reader = #sparse_file_reader{num_bytes=NumBytes}) ->
     case do_read(Reader, NumBytes) of
-        {ok, Reader2, RealName} ->
+        {ok, RealName, Reader2} ->
             {RealName, Reader2};
         {error, _} = Err ->
             throw(Err)
@@ -1634,19 +1658,22 @@ skip_unread(Reader=#reader{pos=Pos}) when (Pos rem ?BLOCK_SIZE) > 0 ->
 skip_unread(Reader=#reader{}) ->
     {ok, Reader};
 skip_unread(#reg_file_reader{handle=Handle,num_bytes=0}) ->
-    {ok, Handle};
+    skip_unread(Handle);
 skip_unread(Reader = #reg_file_reader{}) ->
     #reg_file_reader{handle=Handle} = skip_file(Reader),
     {ok, Handle};
 skip_unread(#sparse_file_reader{handle=Handle,num_bytes=0}) ->
-    {ok, Handle};
+    skip_unread(Handle);
 skip_unread(Reader = #sparse_file_reader{}) ->
     #sparse_file_reader{handle=Handle} = skip_file(Reader),
     {ok, Handle}.
 
-write_extracted_element(#tar_header{name=Name,typeflag=Type},Bin,#read_opts{output=memory}) ->
+write_extracted_element(#tar_header{name=Name,typeflag=Type},
+                        Bin,
+                        Opts=#read_opts{output=memory}) ->
     case typeflag(Type) of
         regular ->
+            read_verbose(Opts, "x ~ts~n", [Name]),
             {ok, {Name, Bin}};
         _ ->
             ok
@@ -1656,10 +1683,19 @@ write_extracted_element(Header=#tar_header{name=Name}, Bin, Opts) ->
     Created =
 	case typeflag(Header#tar_header.typeflag) of
 	    regular ->
-		write_extracted_file(Name1, Bin, Opts);
+		case write_extracted_file(Name1, Bin, Opts) of
+                    not_written ->
+                        read_verbose(Opts, "x ~ts - exists, not created~n", [Name]),
+                        not_written;
+                    Ok ->
+                        read_verbose(Opts, "x ~ts~n", [Name]),
+                        Ok
+                end;
 	    directory ->
+                read_verbose(Opts, "x ~ts~n", [Name]),
 		create_extracted_dir(Name1, Opts);
 	    symlink ->
+                read_verbose(Opts, "x ~ts~n", [Name]),
 		create_symlink(Name1, Header#tar_header.linkname, Opts);
 	    Other -> % Ignore.
 		read_verbose(Opts, "x ~ts - unsupported type ~p~n",
@@ -1704,12 +1740,8 @@ write_extracted_file(Name, Bin, Opts) ->
 	    false -> true
 	end,
     case Write of
-	true ->
-	    read_verbose(Opts, "x ~ts~n", [Name]),
-	    write_file(Name, Bin);
-	false ->
-	    read_verbose(Opts, "x ~ts - exists, not created~n", [Name]),
-	    not_written
+	true  -> write_file(Name, Bin);
+	false -> not_written
     end.
 
 write_file(Name, Bin) ->
@@ -1722,7 +1754,8 @@ write_file(Name, Bin) ->
 	    throw({error, Reason})
     end.
 
-set_extracted_file_info(_, #tar_header{typeflag = symlink}) -> ok;
+set_extracted_file_info(_, #tar_header{typeflag = ?TYPE_SYMLINK}) -> ok;
+set_extracted_file_info(_, #tar_header{typeflag = ?TYPE_LINK}) -> ok;
 set_extracted_file_info(Name, #tar_header{mtime=Mtime,mode=Mode}) ->
     Info = #file_info{mode=Mode, mtime=Mtime},
     file:write_file_info(Name, Info).
@@ -1732,12 +1765,11 @@ set_extracted_file_info(Name, #tar_header{mtime=Mtime,mode=Mode}) ->
 make_dirs(Name, file) ->
 	filelib:ensure_dir(Name);
 make_dirs(Name, dir) ->
-	filelib:ensure_dir(join_path(Name,"*")).
+	filelib:ensure_dir(filename:join(Name,"*")).
 
 %% Prints the message on if the verbose option is given (for reading).
 read_verbose(#read_opts{verbose=true}, Format, Args) ->
-    io:format(Format, Args),
-    io:nl();
+    io:format(Format, Args);
 read_verbose(_, _, _) ->
     ok.
 
@@ -1751,13 +1783,30 @@ add_verbose(_, _, _) ->
 %% I/O primitives
 %%%%%%%%%%%%%%%%%%
 
-do_write(#reader{handle=Handle,func=Fun}, Data) when is_function(Fun,2) ->
-    Fun(write,{Handle,Data}).
+do_write(Reader = #reader{handle=Handle,func=Fun}, Data)
+  when is_function(Fun,2) ->
+    case Fun(write,{Handle,Data}) of
+        ok ->
+            {ok, Pos, Reader2} = do_position(Reader, {cur,0}),
+            {ok, Reader2#reader{pos=Pos}};
+        {error, _} = Err ->
+            Err
+    end.
 
-do_position(Reader = #reader{handle=Handle,func=Fun}, Pos) when is_function(Fun,2)->
+do_copy(Reader = #reader{handle=Handle,pos=Pos,func=Fun}, Source)
+  when is_function(Fun, 2) ->
+    % TODO: Make this use Fun
+    {ok, BytesCopied} = file:copy(Source, Handle),
+    {ok, BytesCopied, Reader#reader{pos=Pos+BytesCopied}}.
+
+do_position(Reader = #reader{handle=Handle,func=Fun}, Pos)
+  when is_function(Fun,2)->
     case Fun(position, {Handle,Pos}) of
         {ok, NewPos} ->
-            {ok, NewPos, Reader#reader{pos=NewPos}};
+            % since Pos may not always be an absolute seek,
+            % make sure we update the reader with the new absolute position
+            {ok, AbsPos} = Fun(position, {Handle, {cur, 0}}),
+            {ok, NewPos, Reader#reader{pos=AbsPos}};
         Other ->
             Other
     end.
@@ -1766,35 +1815,38 @@ do_read(Reader = #reg_file_reader{handle=Handle,pos=Pos,size=Size}, Len) ->
     NumBytes = Size - Pos,
     ActualLen = if NumBytes - Len < 0 -> NumBytes; true -> Len end,
     case do_read(Handle, ActualLen) of
-        {ok, Handle2, Bin} ->
-            NewPos = Size - (Pos + ActualLen),
+        {ok, Bin, Handle2} ->
+            NewPos = Pos + ActualLen,
             NumBytes2 = Size - NewPos,
-            {ok, Reader#reg_file_reader{handle=Handle2,pos=NewPos,num_bytes=NumBytes2}, Bin};
+            {ok, Bin, Reader#reg_file_reader{handle=Handle2,pos=NewPos,num_bytes=NumBytes2}};
         Other ->
             Other
     end;
 do_read(Reader = #sparse_file_reader{}, Len) ->
     do_sparse_read(Reader, Len);
-do_read(Reader = #reader{pos=Pos,handle=Handle,func=Fun}, Len) when is_function(Fun,2)->
+do_read(Reader = #reader{pos=Pos,handle=Handle,func=Fun}, Len)
+  when is_function(Fun,2)->
     %% Always convert to binary internally
     case Fun(read2,{Handle,Len}) of
         {ok, List} when is_list(List) ->
             Bin = list_to_binary(List),
             NewPos = Pos+byte_size(Bin),
-            {ok, Reader#reader{pos=NewPos}, Bin};
+            {ok, Bin, Reader#reader{pos=NewPos}};
         {ok, Bin} when is_binary(Bin) ->
             NewPos = Pos+byte_size(Bin),
-            {ok, Reader#reader{pos=NewPos}, Bin};
+            {ok, Bin, Reader#reader{pos=NewPos}};
         Other ->
             Other
     end.
 
-do_sparse_read(Reader = #sparse_file_reader{sparse_map=#sparse_array{entries=[#sparse_entry{num_bytes=0}|Entries]}}, Len) ->
+do_sparse_read(Reader=#sparse_file_reader{sparse_map=#sparse_array{
+                entries=[#sparse_entry{num_bytes=0}|Entries]}}, Len) ->
     % skip all empty fragments
     SparseMap = Reader#sparse_file_reader.sparse_map#sparse_array{entries=Entries},
     Reader2 = Reader#sparse_file_reader{sparse_map=SparseMap},
     do_sparse_read(Reader2, Len);
-do_sparse_read(Reader = #sparse_file_reader{pos=Pos,sparse_map=#sparse_array{entries=[]},size=Size}, Len)
+do_sparse_read(Reader = #sparse_file_reader{pos=Pos,sparse_map=#sparse_array{
+                entries=[]},size=Size}, Len)
   when Pos < Size ->
     % if there are no more fragments, it is possible that there is one last sparse hole
     % this behaviour matches the BSD tar utility
@@ -1802,12 +1854,14 @@ do_sparse_read(Reader = #sparse_file_reader{pos=Pos,sparse_map=#sparse_array{ent
     read_sparse_hole(Reader, Size, Len);
 do_sparse_read(#sparse_file_reader{sparse_map=#sparse_array{entries=[]}}, _Len) ->
     eof;
-do_sparse_read(Reader=#sparse_file_reader{pos=Pos,sparse_map=#sparse_array{entries=[#sparse_entry{offset=Offset}|Entries]}}, Len)
+do_sparse_read(Reader=#sparse_file_reader{pos=Pos,sparse_map=#sparse_array{
+                 entries=[#sparse_entry{offset=Offset}|Entries]}}, Len)
   when Pos < Offset ->
     SparseMap = Reader#sparse_file_reader.sparse_map#sparse_array{entries=Entries},
     Reader2 = Reader#sparse_file_reader{sparse_map=SparseMap},
     read_sparse_hole(Reader2, Offset, Len);
-do_sparse_read(Reader=#sparse_file_reader{pos=Pos,sparse_map=#sparse_array{entries=[Entry|Entries]}}, Len) ->
+do_sparse_read(Reader=#sparse_file_reader{pos=Pos,sparse_map=#sparse_array{
+                 entries=[Entry|Entries]}}, Len) ->
     % we're in a data fragment, so read from it
     % end offset of fragment
     EndPos = Entry#sparse_entry.offset + Entry#sparse_entry.num_bytes,
@@ -1815,18 +1869,23 @@ do_sparse_read(Reader=#sparse_file_reader{pos=Pos,sparse_map=#sparse_array{entri
     NumBytes = EndPos - Pos,
     ActualLen = if Len > NumBytes -> NumBytes; true -> Len end,
     case do_read(Reader#sparse_file_reader.handle, ActualLen) of
-        {ok, Handle, Bin} ->
+        {ok, Bin, Handle} ->
             BytesRead = byte_size(Bin),
             ActualEndPos = Pos+BytesRead,
             Sparsemap = if ActualEndPos =:= EndPos ->
-                    Reader#sparse_file_reader.sparse_map#sparse_array{entries=Entries};
+                    Reader#sparse_file_reader.sparse_map#sparse_array{
+                      entries=Entries};
                true ->
                     Reader#sparse_file_reader.sparse_map
             end,
             Size = Reader#sparse_file_reader.size,
             NumBytes2 = Size - ActualEndPos,
-            Reader2 = Reader#sparse_file_reader{handle=Handle,pos=ActualEndPos,num_bytes=NumBytes2,sparse_map=Sparsemap},
-            {ok, Reader2, Bin};
+            Reader2 = Reader#sparse_file_reader{
+                        handle=Handle,
+                        pos=ActualEndPos,
+                        num_bytes=NumBytes2,
+                        sparse_map=Sparsemap},
+            {ok, Bin, Reader2};
         Other ->
             Other
     end.
@@ -1843,7 +1902,10 @@ read_sparse_hole(Reader = #sparse_file_reader{handle=Handle,pos=Pos}, Offset, Le
     case do_position(Handle, Handle#reader.pos + (Pos+N2)) of
         {ok, _, Handle2} ->
             NumBytes = Reader#sparse_file_reader.size - (Pos+N2),
-            {ok, Reader#sparse_file_reader{handle=Handle2,num_bytes=NumBytes,pos=Pos+N2}, Bin};
+            {ok, Bin, Reader#sparse_file_reader{
+                        handle=Handle2,
+                        num_bytes=NumBytes,
+                        pos=Pos+N2}};
         Other ->
             Other
     end.
@@ -1899,5 +1961,32 @@ read_opts([], Opts) ->
     Opts.
 
 -ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% Reads tar archives produced by various implementations
+read_test() ->
+    [?assertMatch({ok, _}, table("test/support/gnu.tar")),
+     ?assertMatch({ok, _}, table("test/support/bsd.tar")),
+     ?assertMatch({ok, _}, table("test/support/erl_tar.tar")),
+     ?assertMatch({ok, _}, table("test/support/erl_tar2.tar"))].
+
+%% Produces a tar archive, extracts it, and verifies that everything
+%% archived was extracted as expected.
+create_test() ->
+    Files = [{"lorem_ipsum.txt", "test/support/lorem_ipsum.txt"},
+             {"lorem_ipsum.link", "test/support/lorem_ipsum.link"},
+             {"testdir", "test/support/testdir"}],
+    {"Create",
+     {setup,
+        fun() -> ok end,
+        fun (_) -> ?cmd("rm -f test_create_tmp.tar") end,
+        fun (_) ->
+            [?assertMatch(ok, create("test_create_tmp.tar", Files)),
+             ?assertMatch({ok, _}, table("test_create_tmp.tar")),
+             ?assertMatch(ok, extract("test_create_tmp.tar", [{cwd, "extracted"}])),
+             ?assertMatch({ok, #file_info{type=regular}}, file:read_link_info("extracted/lorem_ipsum.txt")),
+             ?assertMatch({ok, #file_info{type=symlink}}, file:read_link_info("extracted/lorem_ipsum.link")),
+             ?assertMatch({ok, #file_info{type=regular}}, file:read_link_info("extracted/testdir/foo/.gitignore"))]
+        end}}.
 
 -endif.
