@@ -1,4 +1,4 @@
-.PHONY: help test
+.PHONY: help test dialyzer
 
 IMAGE_NAME ?= erl_tar2
 
@@ -17,10 +17,13 @@ _build:
 	mkdir -p _build
 
 _build/%.beam: %.erl
-	erlc -o _build erl_tar.erl
+	erlc -o _build +debug_info erl_tar2.erl
 
 shell: ## Shell with erl_tar2 loaded
 	erl -pa _build
+
+dialyzer: build ## Run dialyzer
+	dialyzer -pa _build --build_plt --output_plt _build/erl_tar2.plt -Wunderspecs -Wrace_conditions -Werror_handling -Wunmatched_returns -Wunknown --apps erts kernel stdlib compiler hipe syntax_tools crypto _build/erl_tar2.beam
 
 clean: ## Test
 	rm -rf _build

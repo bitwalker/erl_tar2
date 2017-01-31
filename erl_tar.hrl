@@ -3,6 +3,7 @@
 	 read_info,          % Fun to use for read file/link info.
 	 chunk_size = 0,     % For file reading when sending to sftp. 0=do not chunk
          verbose = false}).  % Verbose on/off.
+-type add_opts() :: #add_opts{}.
 
 %% Options used when reading a tar archive.
 -record(read_opts, {
@@ -12,6 +13,7 @@
           output = file :: 'file' | 'memory',
           open_mode = [],                      % Open mode options.
           verbose = false :: boolean()}).      % Verbose on/off.
+-type read_opts() :: #read_opts{}.
 
 -type add_opt() :: dereference |
                    verbose |
@@ -52,16 +54,19 @@
           ctime :: calendar:datetime(),         % status change time
           xattrs = #{} :: map()                 % extended attributes
          }).
+-type tar_header() :: #tar_header{}.
 
 %% Metadata for a sparse file fragment
 -record(sparse_entry, {
          offset = 0 :: non_neg_integer(),
          num_bytes = 0 :: non_neg_integer()}).
+-type sparse_entry() :: #sparse_entry{}.
 %% Contains metadata about fragments of a sparse file
 -record(sparse_array, {
-          entries = [] :: [#sparse_entry{}],
+          entries = [] :: [sparse_entry()],
           is_extended = false :: boolean(),
           max_entries = 0 :: non_neg_integer()}).
+-type sparse_array() :: #sparse_array{}.
 %% A subset of tar header fields common to all tar implementations
 -record(header_v7, {
           name :: string(),
@@ -73,9 +78,10 @@
           checksum :: integer(),
           typeflag :: char(),
           linkname :: string()}).
+-type header_v7() :: #header_v7{}.
 %% The set of fields specific to GNU tar formatted archives
 -record(header_gnu, {
-          header_v7 :: #header_v7{},
+          header_v7 :: header_v7(),
           magic :: binary(),
           version :: binary(),
           uname :: string(),
@@ -84,11 +90,12 @@
           devminor :: pos_integer(),
           atime :: pos_integer(),
           ctime :: pos_integer(),
-          sparse :: #sparse_array{},
+          sparse :: sparse_array(),
           real_size :: non_neg_integer()}).
+-type header_gnu() :: #header_gnu{}.
 %% The set of fields specific to STAR-formatted archives
 -record(header_star, {
-          header_v7 :: #header_v7{},
+          header_v7 :: header_v7(),
           magic :: binary(),
           version :: binary(),
           uname :: string(),
@@ -99,9 +106,10 @@
           atime :: pos_integer(),
           ctime :: pos_integer(),
           trailer :: binary()}).
+-type header_star() :: #header_star{}.
 %% The set of fields specific to USTAR-formatted archives
 -record(header_ustar, {
-          header_v7 :: #header_v7{},
+          header_v7 :: header_v7(),
           magic :: binary(),
           version :: binary(),
           uname :: string(),
@@ -109,8 +117,12 @@
           devmajor :: pos_integer(),
           devminor :: pos_integer(),
           prefix :: string()}).
+-type header_ustar() :: #header_ustar{}.
 
--type header_fields() :: #header_v7{} | #header_gnu{} | #header_star{} | #header_ustar{}.
+-type header_fields() :: header_v7() |
+                         header_gnu() |
+                         header_star() |
+                         header_ustar().
 
 %% The overall tar reader, it holds the low-level file handle,
 %% it's access, position, and the I/O primitives wrapper.
@@ -120,6 +132,7 @@
           pos = 0 :: non_neg_integer(),
           func
          }).
+-type reader() :: #reader{}.
 %% A reader for a regular file within the tar archive,
 %% It tracks it's current state relative to that file.
 -record(reg_file_reader, {
@@ -128,6 +141,7 @@
           pos = 0,
           size = 0
          }).
+-type reg_file_reader() :: #reg_file_reader{}.
 %% A reader for a sparse file within the tar archive,
 %% It tracks it's current state relative to that file.
 -record(sparse_file_reader, {
@@ -137,9 +151,10 @@
           size = 0, % total size of file
           sparse_map = #sparse_array{}
          }).
+-type sparse_file_reader() :: #sparse_file_reader{}.
 
 %% Types for the readers
--type reader_type() :: #reg_file_reader{} | #sparse_file_reader{}.
+-type reader_type() :: reg_file_reader() | sparse_file_reader().
 -type handle() :: file:io_device() | term().
 
 %% Types for the I/O primitive wrapper functions

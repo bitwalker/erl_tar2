@@ -22,6 +22,6 @@ The end goal is to get these changes merged into OTP itself.
   - [x] Try to fit all lines within 80 chars
   - [x] Consistent typespecs
 - [x] Create test suite for erl_tar
-- [ ] Run dialyzer
+- [x] Run dialyzer, update accordingly
 - [ ] Update documentation, comments
 - [ ] Open PR with as much detail as possible for discussion

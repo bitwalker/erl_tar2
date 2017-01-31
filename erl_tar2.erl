@@ -27,13 +27,13 @@
 %%   http://www.freebsd.org/cgi/man.cgi?query=tar&sektion=5
 %%   http://www.gnu.org/software/tar/manual/html_node/Standard.html
 %%   http://pubs.opengroup.org/onlinepubs/9699919799/utilities/pax.html
--module(erl_tar).
+-module(erl_tar2).
 
 -export([init/3,
          create/2, create/3,
          extract/1, extract/2,
          table/1, table/2, t/1, tt/1,
-	 open/2, close/1,
+         open/2, close/1,
          parse_octal/1,
          add/3, add/4,
          format_error/1]).
@@ -76,7 +76,7 @@ format_error(Term) ->
     lists:flatten(io_lib:format("~tp", [Term])).
 
 %% Initializes a new reader given a custom file handle and I/O wrappers
--spec init(handle(), file:mode(), file_op()) -> {ok, #reader{}}.
+-spec init(handle(), write | read, file_op()) -> {ok, reader()}.
 init(Handle, AccessMode, Fun) when is_function(Fun, 2) ->
     Reader = #reader{handle=Handle,access=AccessMode,func=Fun},
     {ok, Pos, Reader2} = do_position(Reader, {cur, 0}),
@@ -104,6 +104,10 @@ extract(Name, Opts) ->
     Acc = if Opts2#read_opts.output =:= memory -> []; true -> ok end,
     foldl_read(Name, fun extract1/4, Acc, Opts2).
 
+-spec extract1(eof | tar_header(), reader_type(), read_opts(), ok | [{string(), binary()}]) ->
+                      {ok, {ok, [{string(), binary()}]}, reader_type()} |
+                      {ok, ok, reader_type()} |
+                      {error, term()}.
 extract1(eof, Reader, _, Acc) when is_list(Acc) ->
     {ok, {ok, lists:reverse(Acc)}, Reader};
 extract1(eof, Reader, _, Acc) ->
@@ -129,6 +133,7 @@ extract1(Header = #tar_header{name=Name,size=Size}, Reader, Opts, Acc) ->
     end.
 
 %% Checks if the file Name should be extracted.
+-spec check_extract(string(), read_opts()) -> boolean().
 check_extract(_, #read_opts{files=all}) ->
     true;
 check_extract(Name, #read_opts{files=Files}) ->
@@ -165,6 +170,9 @@ table(Name) ->
 table(Name, Opts) ->
     foldl_read(Name, fun table1/4, [], table_opts(Opts)).
 
+-spec table1(eof | tar_header(), reader_type(), read_opts(), [string() | tuple()]) ->
+                    {ok, {ok, [string() | tuple()]}, reader_type()} |
+                    {error, term()}.
 table1(eof, Reader, _, Result) ->
     {ok, {ok, lists:reverse(Result)}, Reader};
 table1(Header = #tar_header{}, Reader, #read_opts{verbose=Verbose}, Result) ->
@@ -267,6 +275,8 @@ month(12) -> "Dec".
 
 %%%================================================================
 %%% The open function with friends is to keep the file and binary api of this module
+-spec open(file:filename(), [write | compressed | cooked]) ->
+                  {ok, reader()} | {error, term()}.
 open(Name, Mode) ->
     case open_mode(Mode) of
 	{ok, Access, Raw, Opts} ->
@@ -275,6 +285,10 @@ open(Name, Mode) ->
 	    {error, {Name, Reason}}
     end.
 
+-spec open1({binary, binary()} | {file, term()} | file:filename(),
+            read | write,
+            true | false,
+            [compressed | cooked]) -> {ok, reader()} | {error, term()}.
 open1({binary,Bin}, read, _Raw, Opts) ->
     case file:open(Bin, [ram,binary,read]) of
 	{ok,File} ->
@@ -325,7 +339,7 @@ file_op(close, Fd) ->
     file:close(Fd).
 
 %% Closes a tar archive.
--spec close(#reader{}) -> ok | {error, term()}.
+-spec close(reader()) -> ok | {error, term()}.
 close(Reader=#reader{access=read}) ->
     ok = do_close(Reader);
 close(Reader=#reader{access=write}) ->
@@ -384,7 +398,7 @@ do_create(TarFile, [Name|Rest], Opts) ->
     end.
 
 %% Adds a file to a tape archive.
--spec add(#reader{}, string() | {string(), string() | binary()}, [add_opt()]) ->
+-spec add(reader(), string() | {string(), string() | binary()}, [add_opt()]) ->
                  ok | {error, {string(), term()}}.
 add(Reader, Name, Options) ->
     add(Reader, Name, Name, Options).
@@ -891,7 +905,7 @@ to_sparse_entry(Bin) when is_binary(Bin), byte_size(Bin) =:= 24 ->
        num_bytes=binary_to_integer(binary_part(Bin, 12, 12))
       }.
 
--spec get_format(binary()) -> {ok, pos_integer(), #header_v7{}} | ?FORMAT_UNKNOWN.
+-spec get_format(binary()) -> {ok, pos_integer(), header_v7()} | ?FORMAT_UNKNOWN.
 get_format(Bin) when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
     V7 = to_v7(Bin),
     Checksum = case parse_octal(V7#header_v7.checksum) of
@@ -1171,8 +1185,8 @@ convert_header(_Bin, _Reader) ->
 %% on the provided file_info record. If the file is
 %% a symlink, then `link` is used as the link target.
 %% If the file is a directory, a slash is appended to the name.
--spec fileinfo_to_header(string(), #file_info{}, string()) ->
-                                #tar_header{} | {error, term()}.
+-spec fileinfo_to_header(string(), file:file_info(), string()) ->
+                                tar_header() | {error, term()}.
 fileinfo_to_header(Name, Fi = #file_info{}, Link) ->
     BaseHeader = #tar_header{name=Name,
                          mtime=Fi#file_info.mtime,
@@ -1353,7 +1367,7 @@ do_get_file_reader(Reader, Header, Format, Extra)
 %% NOTE: The GNU manual says that numeric values should be encoded in octal format.
 %% However, the GNU tar utility itself outputs these values in decimal. As such, we
 %% treat values as being encoded in decimal.
--spec read_gnu_sparsemap_1_0(reader_type()) -> {#sparse_array{}, reader_type()}.
+-spec read_gnu_sparsemap_1_0(reader_type()) -> {sparse_array(), reader_type()}.
 read_gnu_sparsemap_1_0(Reader) ->
     case feed_tokens(Reader, 1) of
         eof ->
@@ -1431,7 +1445,7 @@ count_newlines(<<_C, Bin/binary>>, Count) ->
 
 %% Reads the sparse map as stored in GNU's PAX sparse format version 0.1.
 %% The sparse map is stored in the PAX headers.
--spec read_gnu_sparsemap_0_1(map(), binary()) -> #sparse_array{}.
+-spec read_gnu_sparsemap_0_1(map(), binary()) -> sparse_array().
 read_gnu_sparsemap_0_1(#{?PAX_GNU_SPARSE_NUMBLOCKS:=NumEntriesStr,
                          ?PAX_GNU_SPARSE_MAP:=SparseMap}, Format) ->
     NumEntries = binary_to_integer(NumEntriesStr),
@@ -1484,7 +1498,7 @@ get_sparse_size(_, Default) ->
 
 
 %% Applies all known PAX attributes to the current tar header
--spec merge_pax(#tar_header{}, map()) -> #tar_header{}.
+-spec merge_pax(tar_header(), map()) -> tar_header().
 merge_pax(Header, ExtraHeaders) when is_map(ExtraHeaders) ->
     merge_pax(Header, maps:to_list(ExtraHeaders));
 merge_pax(Header, []) ->
@@ -1554,8 +1568,8 @@ parse_pax_time(Bin) when is_binary(Bin) ->
 
 %% Given a sparse or regular file reader, reads the whole file and
 %% parses all extended attributes it contains.
--spec parse_pax(#sparse_file_reader{} | #reg_file_reader{}) ->
-                       {#tar_header{}, #reader{}}.
+-spec parse_pax(sparse_file_reader() | reg_file_reader()) ->
+                       {tar_header(), reader()}.
 parse_pax(#sparse_file_reader{handle=Handle,num_bytes=0}) ->
     {#{}, Handle};
 parse_pax(#sparse_file_reader{handle=Handle,num_bytes=NumBytes}) ->
@@ -1584,7 +1598,7 @@ parse_pax(#reg_file_reader{handle=Handle,num_bytes=NumBytes}) ->
 do_parse_pax(Reader, <<>>, Sparsemap, Headers) when byte_size(Sparsemap) > 0 ->
     % truncate comma
     Sparsemap2 = binary_part(Sparsemap, 0, byte_size(Sparsemap) - 1),
-    Headers2 = map:put(Headers, ?PAX_GNU_SPARSE_MAP, Sparsemap2),
+    Headers2 = maps:put(?PAX_GNU_SPARSE_MAP, Sparsemap2, Headers),
     {Headers2, Reader};
 do_parse_pax(Reader, <<>>, _Sparsemap, Headers) ->
     {Headers, Reader};
@@ -1916,7 +1930,7 @@ read_sparse_hole(Reader = #sparse_file_reader{handle=Handle,pos=Pos}, Offset, Le
        true ->
             N
     end,
-    Bin = << <<X>> || X <- lists:sequence(N2, 0) >>,
+    Bin = binary:copy(<<0>>, N2),
     case do_position(Handle, Handle#reader.pos + (Pos+N2)) of
         {ok, _, Handle2} ->
             NumBytes = Reader#sparse_file_reader.size - (Pos+N2),
