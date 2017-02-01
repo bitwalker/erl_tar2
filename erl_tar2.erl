@@ -1691,8 +1691,8 @@ skip_file(Reader=#reg_file_reader{handle=Handle,pos=Pos,size=Size}) ->
          Err ->
             throw(Err)
     end;
-skip_file(Reader=#sparse_file_reader{size=Size}) ->
-    case do_read(Reader, Size) of
+skip_file(Reader=#sparse_file_reader{pos=Pos,size=Size}) ->
+    case do_read(Reader, Size-Pos) of
         {ok, _, Reader2} ->
             Reader2;
         Err ->
@@ -1901,26 +1901,34 @@ do_read(Reader = #reader{pos=Pos,handle=Handle,func=Fun}, Len)
             Other
     end.
 
+
+do_sparse_read(Reader, Len) ->
+    do_sparse_read(Reader, Len, <<>>).
+
 do_sparse_read(Reader=#sparse_file_reader{
-                 sparse_map=[#sparse_entry{num_bytes=0}|Entries]}, Len) ->
+                 sparse_map=[#sparse_entry{num_bytes=0}|Entries]}, Len, Acc) ->
     % skip all empty fragments
     Reader2 = Reader#sparse_file_reader{sparse_map=Entries},
-    do_sparse_read(Reader2, Len);
-do_sparse_read(Reader = #sparse_file_reader{pos=Pos,sparse_map=[],size=Size}, Len)
+    do_sparse_read(Reader2, Len, Acc);
+do_sparse_read(Reader = #sparse_file_reader{
+                 pos=Pos,sparse_map=[],size=Size}, Len, Acc)
   when Pos < Size ->
     % if there are no more fragments, it is possible that there is one last sparse hole
     % this behaviour matches the BSD tar utility
     % however, GNU tar stops returning data even if we haven't reached the end
-    read_sparse_hole(Reader, Size, Len);
-do_sparse_read(#sparse_file_reader{sparse_map=[]}, _Len) ->
-    eof;
+    {ok, Bin, Reader2} = read_sparse_hole(Reader, Size, Len),
+    do_sparse_read(Reader2, Len-byte_size(Bin), <<Acc/binary,Bin/binary>>);
+do_sparse_read(Reader=#sparse_file_reader{sparse_map=[]}, _Len, Acc) ->
+    {ok, Acc, Reader};
+do_sparse_read(Reader=#sparse_file_reader{}, 0, Acc) ->
+    {ok, Acc, Reader};
 do_sparse_read(Reader=#sparse_file_reader{pos=Pos,
-                 sparse_map=[#sparse_entry{offset=Offset}|Entries]}, Len)
+                 sparse_map=[#sparse_entry{offset=Offset}|_]}, Len, Acc)
   when Pos < Offset ->
-    Reader2 = Reader#sparse_file_reader{sparse_map=Entries},
-    read_sparse_hole(Reader2, Offset, Len);
+    {ok, Bin, Reader2} = read_sparse_hole(Reader, Offset, Offset-Pos),
+    do_sparse_read(Reader2, Len-byte_size(Bin), <<Acc/binary,Bin/binary>>);
 do_sparse_read(Reader=#sparse_file_reader{pos=Pos,
-                 sparse_map=[Entry|Entries]}, Len) ->
+                 sparse_map=[Entry|Entries]}, Len, Acc) ->
     % we're in a data fragment, so read from it
     % end offset of fragment
     EndPos = Entry#sparse_entry.offset + Entry#sparse_entry.num_bytes,
@@ -1942,7 +1950,7 @@ do_sparse_read(Reader=#sparse_file_reader{pos=Pos,
                         handle=Handle,
                         pos=ActualEndPos,
                         num_bytes=NumBytes2},
-            {ok, Bin, Reader3};
+            do_sparse_read(Reader3, Len-byte_size(Bin), <<Acc/binary,Bin/binary>>);
         Other ->
             Other
     end.
