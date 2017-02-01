@@ -48,8 +48,8 @@
           linkname = "" :: string(),            % target name of link
           uname = "" :: string(),               % user name of owner
           gname = "" :: string(),               % group name of owner
-          devmajor = 0 :: pos_integer(),        % major number of character or block device
-          devminor = 0 :: pos_integer(),        % minor number of character or block device
+          devmajor = 0 :: non_neg_integer(),    % major number of character or block device
+          devminor = 0 :: non_neg_integer(),    % minor number of character or block device
           atime :: calendar:datetime(),         % access time
           ctime :: calendar:datetime(),         % status change time
           xattrs = #{} :: map()                 % extended attributes
@@ -69,42 +69,42 @@
 -type sparse_array() :: #sparse_array{}.
 %% A subset of tar header fields common to all tar implementations
 -record(header_v7, {
-          name :: string(),
-          mode :: string(),
-          uid :: non_neg_integer(),
-          gid :: non_neg_integer(),
-          size :: non_neg_integer(),
-          mtime :: pos_integer(),
-          checksum :: integer(),
-          typeflag :: char(),
-          linkname :: string()}).
+          name :: binary(),
+          mode :: binary(), % octal
+          uid :: binary(), % integer
+          gid :: binary(), % integer
+          size :: binary(), % integer
+          mtime :: binary(), % integer
+          checksum :: binary(), % integer
+          typeflag :: byte(), % char
+          linkname :: binary()}).
 -type header_v7() :: #header_v7{}.
 %% The set of fields specific to GNU tar formatted archives
 -record(header_gnu, {
           header_v7 :: header_v7(),
           magic :: binary(),
           version :: binary(),
-          uname :: string(),
-          gname :: string(),
-          devmajor :: pos_integer(),
-          devminor :: pos_integer(),
-          atime :: pos_integer(),
-          ctime :: pos_integer(),
+          uname :: binary(),
+          gname :: binary(),
+          devmajor :: binary(), % integer
+          devminor :: binary(), % integer
+          atime :: binary(), % integer
+          ctime :: binary(), % integer
           sparse :: sparse_array(),
-          real_size :: non_neg_integer()}).
+          real_size :: binary()}). % integer
 -type header_gnu() :: #header_gnu{}.
 %% The set of fields specific to STAR-formatted archives
 -record(header_star, {
           header_v7 :: header_v7(),
           magic :: binary(),
           version :: binary(),
-          uname :: string(),
-          gname :: string(),
-          devmajor :: pos_integer(),
-          devminor :: pos_integer(),
-          prefix :: string(),
-          atime :: pos_integer(),
-          ctime :: pos_integer(),
+          uname :: binary(),
+          gname :: binary(),
+          devmajor :: binary(), % integer
+          devminor :: binary(), % integer
+          prefix :: binary(),
+          atime :: binary(), % integer
+          ctime :: binary(), % integer
           trailer :: binary()}).
 -type header_star() :: #header_star{}.
 %% The set of fields specific to USTAR-formatted archives
@@ -112,11 +112,11 @@
           header_v7 :: header_v7(),
           magic :: binary(),
           version :: binary(),
-          uname :: string(),
-          gname :: string(),
-          devmajor :: pos_integer(),
-          devminor :: pos_integer(),
-          prefix :: string()}).
+          uname :: binary(),
+          gname :: binary(),
+          devmajor :: binary(), % integer
+          devminor :: binary(), % integer
+          prefix :: binary()}).
 -type header_ustar() :: #header_ustar{}.
 
 -type header_fields() :: header_v7() |
@@ -127,16 +127,16 @@
 %% The overall tar reader, it holds the low-level file handle,
 %% it's access, position, and the I/O primitives wrapper.
 -record(reader, {
-          handle :: file:io_device(),
+          handle :: file:io_device() | term(),
           access :: read | write | ram,
           pos = 0 :: non_neg_integer(),
-          func
+          func :: file_op()
          }).
 -type reader() :: #reader{}.
 %% A reader for a regular file within the tar archive,
 %% It tracks it's current state relative to that file.
 -record(reg_file_reader, {
-          handle :: file:io_device(),
+          handle :: reader(),
           num_bytes = 0,
           pos = 0,
           size = 0
@@ -145,7 +145,7 @@
 %% A reader for a sparse file within the tar archive,
 %% It tracks it's current state relative to that file.
 -record(sparse_file_reader, {
-          handle :: file:io_device(),
+          handle :: reader(),
           num_bytes = 0, % bytes remaining
           pos = 0, % pos
           size = 0, % total size of file
@@ -154,15 +154,22 @@
 -type sparse_file_reader() :: #sparse_file_reader{}.
 
 %% Types for the readers
--type reader_type() :: reg_file_reader() | sparse_file_reader().
+-type reader_type() :: reader() | reg_file_reader() | sparse_file_reader().
 -type handle() :: file:io_device() | term().
 
 %% Types for the I/O primitive wrapper functions
--type write_fun() :: fun((write, {handle(), iodata()}) -> ok | {error, term()}).
--type close_fun() :: fun((close, handle()) -> ok | {error, term()}).
--type read_fun() :: fun((read2, {handle(), non_neg_integer()}) -> {ok, string() | binary()} | eof | {error, term()}).
--type position_fun() :: fun((position, {file:io_device() | term, non_neg_integer()}) -> ok | {error, term()}).
--type file_op() :: write_fun() | close_fun() | read_fun() | position_fun().
+-type write_fun() :: fun((write, {handle(), iodata()}) ->
+                                ok | {error, term()}).
+-type close_fun() :: fun((close, handle()) ->
+                                ok | {error, term()}).
+-type read_fun() :: fun((read2, {handle(), non_neg_integer()}) ->
+                               {ok, string() | binary()} | eof | {error, term()}).
+-type position_fun() :: fun((position, {file:io_device() | term, non_neg_integer()}) ->
+                                   {ok, non_neg_integer()} | {error, term()}).
+-type file_op() :: write_fun()
+                 | close_fun()
+                 | read_fun()
+                 | position_fun().
 
 %% These constants (except S_IFMT) are
 %% used to determine what type of device
@@ -372,3 +379,5 @@
                       0,0,0,0,0,0,0,0,0,0,0,0>>).
 
 -define(BILLION, 1000000000).
+
+-define(EPOCH, {{1970,1,1}, {0,0,0}}).

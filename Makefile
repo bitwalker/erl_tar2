@@ -22,8 +22,11 @@ _build/%.beam: %.erl
 shell: ## Shell with erl_tar2 loaded
 	erl -pa _build
 
-dialyzer: build ## Run dialyzer
-	dialyzer -pa _build --build_plt --output_plt _build/erl_tar2.plt -Wunderspecs -Wrace_conditions -Werror_handling -Wunmatched_returns -Wunknown --apps erts kernel stdlib compiler hipe syntax_tools crypto _build/erl_tar2.beam
+dialyzer: build _build/erl_tar2.plt ## Run dialyzer
+	dialyzer -pa _build --plt _build/erl_tar2.plt -Wunknown -Wunmatched_returns _build/erl_tar2.beam
+
+_build/erl_tar2.plt:
+	dialyzer --build_plt --output_plt _build/erl_tar2.plt --apps erts kernel stdlib compiler hipe syntax_tools crypto
 
 clean: ## Test
 	rm -rf _build
