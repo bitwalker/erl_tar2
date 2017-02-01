@@ -897,20 +897,38 @@ to_ustar(V7=#header_v7{}, Bin)
 
 to_sparse_array(Bin) when is_binary(Bin) ->
     MaxEntries = trunc(byte_size(Bin) / 24),
-    IsExtended = not (<<0>> == binary_part(Bin, 24*MaxEntries, 1)),
-    Entries = [to_sparse_entry(binary_part(Bin, N, 24)) ||
-                  N <- lists:seq(0, MaxEntries-1)],
+    IsExtended = 1 =:= binary:at(Bin, 24*MaxEntries),
+    Entries = parse_sparse_entries(Bin, MaxEntries-1, []),
     #sparse_array{
        entries=Entries,
        max_entries=MaxEntries,
        is_extended=IsExtended
       }.
 
+parse_sparse_entries(<<>>, _, Acc) ->
+    Acc;
+parse_sparse_entries(_, -1, Acc) ->
+    Acc;
+parse_sparse_entries(Bin, N, Acc) ->
+    case to_sparse_entry(binary_part(Bin, N*24, 24)) of
+        nil ->
+            parse_sparse_entries(Bin, N-1, Acc);
+        Entry = #sparse_entry{} ->
+            parse_sparse_entries(Bin, N-1, [Entry|Acc])
+    end.
+
+-define(EMPTY_ENTRY, <<0,0,0,0,0,0,0,0,0,0,0,0>>).
 to_sparse_entry(Bin) when is_binary(Bin), byte_size(Bin) =:= 24 ->
-    #sparse_entry{
-       offset=binary_to_integer(binary_part(Bin, 0, 12)),
-       num_bytes=binary_to_integer(binary_part(Bin, 12, 12))
-      }.
+    OffsetBin = binary_part(Bin, 0, 12),
+    NumBytesBin = binary_part(Bin, 12, 12),
+    case {OffsetBin, NumBytesBin} of
+        {?EMPTY_ENTRY, ?EMPTY_ENTRY} ->
+            nil;
+        _ ->
+            #sparse_entry{
+              offset=parse_numeric(OffsetBin),
+              num_bytes=parse_numeric(NumBytesBin)}
+    end.
 
 -spec get_format(binary()) -> {ok, pos_integer(), header_v7()}
                            | ?FORMAT_UNKNOWN
@@ -1017,7 +1035,8 @@ unpack_format(Format, V7 = #header_v7{}, Bin, Reader)
             Gnu = to_gnu(V7, Bin),
             RealSize = parse_numeric(Gnu#header_gnu.real_size),
             {Sparsemap, Reader2} = parse_sparse_map(Gnu, Reader),
-            {Header2, new_sparse_file_reader(Reader2, Sparsemap, RealSize)};
+            Header3 = Header2#tar_header{size=RealSize},
+            {Header3, new_sparse_file_reader(Reader2, Sparsemap, RealSize)};
        true ->
             FileReader = #reg_file_reader{
                             handle = Reader,
@@ -1344,30 +1363,30 @@ foldl_read1(Fun, Accu0, Reader, Opts, ExtraHeaders) ->
 % sparse_file_reader if this is a PAX format sparse file, otherwise it
 % uses the plain reader.
 get_file_reader(Reader, Header,
-      #{?PAX_GNU_SPARSE_MAJOR:=Major,?PAX_GNU_SPARSE_MINOR:=Minor} = Extra) ->
+      #{?PAX_GNU_SPARSE_MAJOR:=Major,
+        ?PAX_GNU_SPARSE_MINOR:=Minor} = Extra) ->
     SparseFormat = iolist_to_binary([Major, $., Minor]),
     do_get_file_reader(Reader, Header, SparseFormat, Extra);
 get_file_reader(Reader, Header,
-      #{?PAX_GNU_SPARSE_NAME:=_SparseName,?PAX_GNU_SPARSE_MAP:=_SparseMap}=Extra) ->
+      #{?PAX_GNU_SPARSE_NAME:=_SparseName,
+        ?PAX_GNU_SPARSE_MAP:=_SparseMap}=Extra) ->
     do_get_file_reader(Reader, Header, <<"0.1">>, Extra);
 get_file_reader(Reader, Header,
-      #{?PAX_GNU_SPARSE_SIZE:=_SparseSize}=Extra) ->
+      #{?PAX_GNU_SPARSE_SIZE:=_SparseSize,
+        ?PAX_GNU_SPARSE_NUMBLOCKS:=_SparseNumBlocks}=Extra) ->
     do_get_file_reader(Reader, Header, <<"0.0">>, Extra);
 get_file_reader(Reader, Header, _ExtraHeaders) ->
     do_get_file_reader(Reader, Header, false, false).
 
 do_get_file_reader(Reader=#reg_file_reader{}, Header, false, false) ->
     {Reader, Header};
-do_get_file_reader(Reader=#sparse_file_reader{handle=Handle}, Header,false,false) ->
-    % unknown sparse format, so treat as a regular file
-    NumBytes = Reader#sparse_file_reader.num_bytes,
-    Size = Reader#sparse_file_reader.size,
-    Pos = Reader#sparse_file_reader.pos,
-    {#reg_file_reader{handle=Handle,pos=Pos,size=Size,num_bytes=NumBytes}, Header};
+do_get_file_reader(Reader=#sparse_file_reader{}, Header,false,false) ->
+    % 0.0 format
+    {Reader, Header};
 do_get_file_reader(Reader, Header, <<"1.0">>, Extra) ->
     SparseName = get_sparse_name(Extra, Header#tar_header.name),
     SparseSize = get_sparse_size(Extra, Header#tar_header.size),
-    Header1 = Header#tar_header{name=SparseName,size=SparseSize},
+    Header1 = Header#tar_header{name=SparseName},
     {SparseArray, Reader2} = read_gnu_sparsemap_1_0(Reader),
     {to_sparse_file_reader(Reader2, SparseSize, SparseArray), Header1};
 do_get_file_reader(Reader, Header, Format, Extra)
@@ -1377,6 +1396,7 @@ do_get_file_reader(Reader, Header, Format, Extra)
     Header1 = Header#tar_header{name=SparseName,size=SparseSize},
     SparseArray = read_gnu_sparsemap_0_1(Extra, Format),
     {to_sparse_file_reader(Reader, SparseSize, SparseArray), Header1}.
+
 
 %% Reads the sparse map as stored in GNU's PAX sparse format version 1.0.
 %% The format of the sparse map consists of a series of newline-terminated numeric
@@ -1617,6 +1637,7 @@ do_parse_pax(Reader, Bin, Sparsemap, Headers) ->
     {Key, Value, Residual} = parse_pax_record(Bin),
     if Key =:= ?PAX_GNU_SPARSE_OFFSET orelse Key =:= ?PAX_GNU_SPARSE_NUMBYTES ->
         % GNU sparse format 0.0 special key, write to sparse map instead of headers map
+        % We will then later parse it as 0.1 format
         Sparsemap2 = <<Sparsemap/binary,Value/binary,$,>>,
         do_parse_pax(Reader, Residual, Sparsemap2, Headers);
        true ->
@@ -1670,12 +1691,10 @@ skip_file(Reader=#reg_file_reader{handle=Handle,pos=Pos,size=Size}) ->
          Err ->
             throw(Err)
     end;
-skip_file(Reader=#sparse_file_reader{handle=Handle,pos=Pos,size=Size}) ->
-    Padding = skip_padding(Size),
-    AbsPos = Handle#reader.pos + (Size-Pos) + Padding,
-    case do_position(Handle, AbsPos) of
-        {ok, _, Handle2} ->
-            Reader#sparse_file_reader{handle=Handle2,num_bytes=0,pos=Size};
+skip_file(Reader=#sparse_file_reader{size=Size}) ->
+    case do_read(Reader, Size) of
+        {ok, _, Reader2} ->
+            Reader2;
         Err ->
             throw(Err)
     end.
@@ -1929,7 +1948,7 @@ do_sparse_read(Reader=#sparse_file_reader{pos=Pos,
     end.
 
 % Reads a sparse hole ending at Offset
-read_sparse_hole(Reader = #sparse_file_reader{handle=Handle,pos=Pos}, Offset, Len) ->
+read_sparse_hole(Reader = #sparse_file_reader{pos=Pos}, Offset, Len) ->
     N = Offset - Pos,
     N2 = if N > Len ->
             Len;
@@ -1937,16 +1956,11 @@ read_sparse_hole(Reader = #sparse_file_reader{handle=Handle,pos=Pos}, Offset, Le
             N
     end,
     Bin = binary:copy(<<0>>, N2),
-    case do_position(Handle, Handle#reader.pos + (Pos+N2)) of
-        {ok, _, Handle2} ->
-            NumBytes = Reader#sparse_file_reader.size - (Pos+N2),
-            {ok, Bin, Reader#sparse_file_reader{
-                        handle=Handle2,
-                        num_bytes=NumBytes,
-                        pos=Pos+N2}};
-        Other ->
-            Other
-    end.
+    NumBytes = Reader#sparse_file_reader.size - (Pos+N2),
+    {ok, Bin, Reader#sparse_file_reader{
+                num_bytes=NumBytes,
+                pos=Pos+N2
+               }}.
 
 -spec do_close(reader_type()) -> ok | {error, term()}.
 do_close(#reg_file_reader{handle=Handle}) -> do_close(Handle);
