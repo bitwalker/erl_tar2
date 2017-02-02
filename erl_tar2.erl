@@ -199,13 +199,14 @@ table1_attrs(#tar_header{name=Name}, _Verbose) ->
 
 typeflag(?TYPE_REGULAR) -> regular;
 typeflag(?TYPE_REGULAR_A) -> regular;
+typeflag(?TYPE_GNU_SPARSE) -> regular;
+typeflag(?TYPE_CONT) -> regular;
 typeflag(?TYPE_LINK) -> link;
 typeflag(?TYPE_SYMLINK) -> symlink;
 typeflag(?TYPE_CHAR) -> char;
 typeflag(?TYPE_BLOCK) -> block;
 typeflag(?TYPE_DIR) -> directory;
 typeflag(?TYPE_FIFO) -> fifo;
-typeflag(?TYPE_CONT) -> reserved;
 typeflag(_) -> unknown.
 
 %%%================================================================
@@ -223,8 +224,8 @@ t(Name) when is_list(Name); is_binary(Name) ->
     end.
 
 %% Prints verbose information about each file in the archive
--spec tt(file:filename()) -> ok | {error, term()}.
-tt(Name) when is_list(Name); is_binary(Name) ->
+-spec tt(open_handle()) -> ok | {error, term()}.
+tt(Name) ->
     case table(Name, [verbose]) of
         {ok, List} ->
             lists:foreach(fun print_header/1, List);
@@ -310,8 +311,12 @@ open1({binary,Bin}, read, _Raw, Opts) when is_binary(Bin) ->
     end;
 open1({file, Fd}, read, _Raw, _Opts) ->
     Reader = #reader{handle=Fd,access=read,func=fun file_op/2},
-    {ok, Pos, Reader2} = do_position(Reader, {cur, 0}),
-    {ok, Reader2#reader{pos=Pos}};
+    case do_position(Reader, {cur, 0}) of
+        {ok, Pos, Reader2} ->
+            {ok, Reader2#reader{pos=Pos}};
+        {error, _} = Err ->
+            Err
+    end;
 open1(Name, Access, Raw, Opts) when is_list(Name) or is_binary(Name) ->
     case file:open(Name, Raw ++ [binary, Access|Opts]) of
         {ok, File} ->
@@ -1259,11 +1264,9 @@ do_fileinfo_to_header(Header, #file_info{type=device,mode=Mode}=Fi, _Link)
     Header#tar_header{typeflag=?TYPE_BLOCK,
                       devmajor=Fi#file_info.major_device,
                       devminor=Fi#file_info.minor_device};
-do_fileinfo_to_header(Header, #file_info{type=other,mode=Mode}=Fi, _Link)
+do_fileinfo_to_header(Header, #file_info{type=other,mode=Mode}, _Link)
   when (Mode band ?S_IFMT) =:= ?S_FIFO ->
-    Header#tar_header{typeflag=?TYPE_FIFO,
-                      devmajor=Fi#file_info.major_device,
-                      devminor=Fi#file_info.minor_device};
+    Header#tar_header{typeflag=?TYPE_FIFO};
 do_fileinfo_to_header(Header, Fi, _Link) ->
     {error, {invalid_file_type, Header#tar_header.name, Fi}}.
 
@@ -1294,10 +1297,7 @@ to_ascii(<<_, Rest/binary>>, Acc) ->
 
 is_header_only_type(?TYPE_SYMLINK) -> true;
 is_header_only_type(?TYPE_LINK)    -> true;
-is_header_only_type(?TYPE_CHAR)    -> true;
-is_header_only_type(?TYPE_BLOCK)   -> true;
 is_header_only_type(?TYPE_DIR)     -> true;
-is_header_only_type(?TYPE_FIFO)    -> true;
 is_header_only_type(_) -> false.
 
 posix_to_erlang_time(Sec) ->
@@ -1582,7 +1582,7 @@ parse_pax_time(Bin) when is_binary(Bin) ->
                         if byte_size(NanoStr0) < ?MAX_NANO_INT_SIZE ->
                                 %% right pad
                                 PaddingN = ?MAX_NANO_INT_SIZE-byte_size(NanoStr0),
-                                Padding = <<0:PaddingN/unit:8>>,
+                                Padding = binary:copy(<<$0>>, PaddingN),
                                 NanoStr1 = <<NanoStr0/binary,Padding/binary>>,
                                 Nano = binary_to_integer(NanoStr1),
                                 (Seconds*?BILLION)+Nano;
@@ -1750,20 +1750,20 @@ write_extracted_element(#tar_header{name=Name0}=Header, Bin, Opts) ->
     Created =
         case typeflag(Header#tar_header.typeflag) of
             regular ->
-                case write_extracted_file(Name1, Bin, Opts) of
-                    not_written ->
-                        read_verbose(Opts, "x ~ts - exists, not created~n", [Name0]),
-                        not_written;
-                    Ok ->
-                        read_verbose(Opts, "x ~ts~n", [Name0]),
-                        Ok
-                end;
+                create_regular(Name1, Name0, Bin, Opts);
             directory ->
                 read_verbose(Opts, "x ~ts~n", [Name0]),
                 create_extracted_dir(Name1, Opts);
             symlink ->
                 read_verbose(Opts, "x ~ts~n", [Name0]),
                 create_symlink(Name1, Header#tar_header.linkname, Opts);
+            Device when Device =:= char orelse Device =:= block ->
+                %% char/block devices will be created as empty files
+                %% and then have their major/minor device set later
+                create_regular(Name1, Name0, <<>>, Opts);
+            fifo ->
+                %% fifo devices will be created as empty files
+                create_regular(Name1, Name0, <<>>, Opts);
             Other -> % Ignore.
                 read_verbose(Opts, "x ~ts - unsupported type ~p~n",
                              [Name0, Other]),
@@ -1772,6 +1772,16 @@ write_extracted_element(#tar_header{name=Name0}=Header, Bin, Opts) ->
     case Created of
         ok  -> set_extracted_file_info(Name1, Header);
         not_written -> ok
+    end.
+
+create_regular(Name, NameInArchive, Bin, Opts) ->
+    case write_extracted_file(Name, Bin, Opts) of
+        not_written ->
+            read_verbose(Opts, "x ~ts - exists, not created~n", [NameInArchive]),
+            not_written;
+        Ok ->
+            read_verbose(Opts, "x ~ts~n", [NameInArchive]),
+            Ok
     end.
 
 create_extracted_dir(Name, _Opts) ->
@@ -1822,9 +1832,26 @@ write_file(Name, Bin) ->
     end.
 
 set_extracted_file_info(_, #tar_header{typeflag = ?TYPE_SYMLINK}) -> ok;
-set_extracted_file_info(_, #tar_header{typeflag = ?TYPE_LINK}) -> ok;
+set_extracted_file_info(_, #tar_header{typeflag = ?TYPE_LINK})    -> ok;
+set_extracted_file_info(Name, #tar_header{typeflag = ?TYPE_CHAR}=Header) ->
+    set_device_info(Name, Header);
+set_extracted_file_info(Name, #tar_header{typeflag = ?TYPE_BLOCK}=Header) ->
+    set_device_info(Name, Header);
 set_extracted_file_info(Name, #tar_header{mtime=Mtime,mode=Mode}) ->
     Info = #file_info{mode=Mode, mtime=Mtime},
+    file:write_file_info(Name, Info).
+
+set_device_info(Name, #tar_header{}=Header) ->
+    Mtime = Header#tar_header.mtime,
+    Mode = Header#tar_header.mode,
+    Devmajor = Header#tar_header.devmajor,
+    Devminor = Header#tar_header.devminor,
+    Info = #file_info{
+              mode=Mode,
+              mtime=Mtime,
+              major_device=Devmajor,
+              minor_device=Devminor
+             },
     file:write_file_info(Name, Info).
 
 %% Makes all directories leading up to the file.
@@ -1977,9 +2004,7 @@ read_sparse_hole(#sparse_file_reader{pos=Pos}=Reader, Offset, Len) ->
                 num_bytes=NumBytes,
                 pos=Pos+N2}}.
 
--spec do_close(reader_type()) -> ok | {error, term()}.
-do_close(#reg_file_reader{handle=Handle}) -> do_close(Handle);
-do_close(#sparse_file_reader{handle=Handle}) -> do_close(Handle);
+-spec do_close(reader()) -> ok | {error, term()}.
 do_close(#reader{handle=Handle,func=Fun}) when is_function(Fun,2) ->
     Fun(close,Handle).
 
