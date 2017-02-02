@@ -1112,7 +1112,10 @@ parse_sparse_map(#sparse_array{is_extended=true,entries=Entries}, Reader, Acc) -
             parse_sparse_map(Sparse2, Reader2, Entries++Acc)
     end;
 parse_sparse_map(#sparse_array{entries=Entries}, Reader, Acc) ->
-    {Entries ++ Acc, Reader}.
+    Sorted = lists:sort(fun (#sparse_entry{offset=A},#sparse_entry{offset=B}) ->
+                                A =< B
+                        end, Entries++Acc),
+    {Sorted, Reader}.
 
 %% Defined by taking the sum of the unsigned byte values of the
 %% entire header record, treating the checksum bytes to as ASCII spaces
@@ -1358,181 +1361,10 @@ foldl_read1(Fun, Accu0, Reader0, Opts, ExtraHeaders) ->
                     foldl_read1(Fun, Accu0, Reader3, Opts, ExtraHeaders2);
                 _ ->
                     Header1 = merge_pax(Header, ExtraHeaders),
-                    {Reader3,Header2} = get_file_reader(Reader2,Header1,ExtraHeaders),
-                    {ok, NewAccu, Reader4} = Fun(Header2, Reader3, Opts, Accu0),
-                    foldl_read1(Fun, NewAccu, Reader4, Opts, #{})
+                    {ok, NewAccu, Reader3} = Fun(Header1, Reader2, Opts, Accu0),
+                    foldl_read1(Fun, NewAccu, Reader3, Opts, #{})
             end
     end.
-
-%% Checks for PAX format sparse headers and uses a
-%% sparse_file_reader if this is a PAX format sparse file, otherwise it
-%% uses the plain reader.
-get_file_reader(Reader, Header,
-                #{?PAX_GNU_SPARSE_MAJOR:=Major,
-                  ?PAX_GNU_SPARSE_MINOR:=Minor} = Extra) ->
-    SparseFormat = iolist_to_binary([Major, $., Minor]),
-    do_get_file_reader(Reader, Header, SparseFormat, Extra);
-get_file_reader(Reader, Header,
-                #{?PAX_GNU_SPARSE_NAME:=_SparseName,
-                  ?PAX_GNU_SPARSE_MAP:=_SparseMap}=Extra) ->
-    do_get_file_reader(Reader, Header, <<"0.1">>, Extra);
-get_file_reader(Reader, Header,
-                #{?PAX_GNU_SPARSE_SIZE:=_SparseSize,
-                  ?PAX_GNU_SPARSE_NUMBLOCKS:=_SparseNumBlocks}=Extra) ->
-    do_get_file_reader(Reader, Header, <<"0.0">>, Extra);
-get_file_reader(Reader, Header, _ExtraHeaders) ->
-    do_get_file_reader(Reader, Header, false, false).
-
-do_get_file_reader(#reg_file_reader{}=Reader, Header, false, false) ->
-    {Reader, Header};
-do_get_file_reader(#sparse_file_reader{}=Reader, Header,false,false) ->
-    %% 0.0 format
-    {Reader, Header};
-do_get_file_reader(Reader, Header, <<"1.0">>, Extra) ->
-    SparseName = get_sparse_name(Extra, Header#tar_header.name),
-    SparseSize = get_sparse_size(Extra, Header#tar_header.size),
-    Header1 = Header#tar_header{name=SparseName},
-    {SparseArray, Reader2} = read_gnu_sparsemap_1_0(Reader),
-    {to_sparse_file_reader(Reader2, SparseSize, SparseArray), Header1};
-do_get_file_reader(Reader, Header, Format, Extra)
-  when Format =:= <<"0.0">>; Format =:= <<"0.1">> ->
-    SparseName = get_sparse_name(Extra, Header#tar_header.name),
-    SparseSize = get_sparse_size(Extra, Header#tar_header.size),
-    Header1 = Header#tar_header{name=SparseName,size=SparseSize},
-    SparseArray = read_gnu_sparsemap_0_1(Extra, Format),
-    {to_sparse_file_reader(Reader, SparseSize, SparseArray), Header1}.
-
-
-%% Reads the sparse map as stored in GNU's PAX sparse format version 1.0.
-%% The format of the sparse map consists of a series of newline-terminated numeric
-%% fields. The first field is the number of entries and is always present. Following
-%% this are the entries, consisting of two fields (offset, num_bytes). This function must
-%% stop reading at the end boundary of the block containing the last newline.
-%%
-%% NOTE: The GNU manual says that numeric values should be encoded in octal format.
-%% However, the GNU tar utility itself outputs these values in decimal. As such, we
-%% treat values as being encoded in decimal.
--spec read_gnu_sparsemap_1_0(reader_type()) -> {sparse_array(), reader_type()}.
-read_gnu_sparsemap_1_0(Reader0) ->
-    {ok, Reader1, Bin0} = feed_tokens(Reader0, 1),
-    case binary:split(Bin0, [<<$\n>>]) of
-        [Token,Bin1] ->
-            NEntries = binary_to_integer(Token),
-            if NEntries < 0 ->
-                    throw({error, invalid_gnu_1_0_sparsemap});
-               true ->
-                    ok
-            end,
-            %% parse all member entries
-            {ok, Reader2, Bin2} = feed_tokens(Reader1, 2*NEntries),
-            Bin3 = <<Bin1/binary,Bin2/binary>>,
-            read_gnu_sparsemap_1_0_entries(Reader2, NEntries, Bin3);
-        _ ->
-            throw({error, invalid_gnu_1_0_sparsemap})
-    end.
-read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin) ->
-    read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin, #sparse_array{}).
-read_gnu_sparsemap_1_0_entries(Reader, 0, _Bin, Acc) ->
-    {Acc, Reader};
-read_gnu_sparsemap_1_0_entries(Reader, NumEntries, Bin,
-                               #sparse_array{entries=Entries}=Acc0) ->
-    case binary:split(Bin, [<<$\n>>]) of
-        [OffsetToken, Bin2] ->
-            case binary:split(Bin2, [<<$\n>>]) of
-                [NumBytesToken, Bin3] ->
-                    Offset = binary_to_integer(OffsetToken),
-                    NumBytes = binary_to_integer(NumBytesToken),
-                    Entry = #sparse_entry{offset=Offset,num_bytes=NumBytes},
-                    Acc1 = Acc0#sparse_array{entries=[Entry|Entries]},
-                    read_gnu_sparsemap_1_0_entries(Reader, NumEntries-1,Bin3,Acc1);
-                _ ->
-                    throw({error, invalid_gnu_1_0_sparsemap})
-            end;
-        _ ->
-            throw({error, invalid_gnu_1_0_sparsemap})
-    end.
-
-
-%% Copies data in ?BLOCK_SIZE chunks from Reader into a
-%% buffer until there are at least Count newlines in the buffer.
-%% It will not read more blocks than needed.
-feed_tokens(Reader, Count) ->
-    feed_tokens(Reader, Count, <<>>).
-feed_tokens(Reader, 0, Buffer) ->
-    {ok, Reader, Buffer};
-feed_tokens(Reader0, Count, Buffer0) ->
-    case do_read(Reader0, ?BLOCK_SIZE) of
-        {ok, Bin, Reader1} ->
-            Buffer1 = <<Buffer0/binary,Bin/binary>>,
-            Newlines = count_newlines(Buffer1),
-            feed_tokens(Reader1, Count-Newlines, Buffer1);
-        _Err ->
-            throw({error, invalid_gnu_1_0_sparsemap})
-    end.
-
-count_newlines(<<>>) -> 0;
-count_newlines(Bin)  -> count_newlines(Bin, 0).
-count_newlines(<<>>, Count) ->
-    Count;
-count_newlines(<<$\n, Bin/binary>>, Count) ->
-    count_newlines(Bin, Count+1);
-count_newlines(<<_C, Bin/binary>>, Count) ->
-    count_newlines(Bin, Count).
-
-
-%% Reads the sparse map as stored in GNU's PAX sparse format version 0.1.
-%% The sparse map is stored in the PAX headers.
--spec read_gnu_sparsemap_0_1(map(), binary()) -> sparse_array().
-read_gnu_sparsemap_0_1(#{?PAX_GNU_SPARSE_NUMBLOCKS:=NumEntriesStr,
-                         ?PAX_GNU_SPARSE_MAP:=SparseMap}, Format) ->
-    NumEntries = binary_to_integer(NumEntriesStr),
-    if NumEntries < 0 orelse (2*NumEntries) < NumEntries ->
-            throw({error, {malformed_gnu_0_1_sparsemap, Format}});
-       true -> ok
-    end,
-    case binary:split(SparseMap, [<<",">>], [global]) of
-        Entries when length(Entries) =:= (2*NumEntries) ->
-            parse_gnu_sparsemap_0_1(Entries);
-        _ ->
-            throw({error, {malformed_gnu_0_1_sparsemap, Format}})
-    end.
-
-parse_gnu_sparsemap_0_1([]) ->
-    #sparse_array{};
-parse_gnu_sparsemap_0_1(Entries) ->
-    Entries2 = parse_gnu_sparsemap_0_1(Entries, []),
-    #sparse_array{entries=Entries2}.
-parse_gnu_sparsemap_0_1([], Acc) ->
-    lists:reverse(Acc);
-parse_gnu_sparsemap_0_1([OffsetStr, NumBytesStr|Rest], Acc) ->
-    Offset=binary_to_integer(OffsetStr),
-    NumBytes=binary_to_integer(NumBytesStr),
-    Entry = #sparse_entry{offset=Offset,num_bytes=NumBytes},
-    parse_gnu_sparsemap_0_1(Rest, [Entry|Acc]).
-
-to_sparse_file_reader(#sparse_file_reader{}=Reader, Size, SparseEntries) ->
-    Reader#sparse_file_reader{
-      num_bytes = Size,
-      size = Size,
-      sparse_map = SparseEntries};
-to_sparse_file_reader(#reg_file_reader{handle=Reader}, Size, SparseEntries) ->
-    #sparse_file_reader{
-       handle=Reader,
-       num_bytes=Size,
-       sparse_map=SparseEntries}.
-
-
-get_sparse_name(#{?PAX_GNU_SPARSE_NAME:=SparseName}, _Default) ->
-    parse_string(SparseName);
-get_sparse_name(_, Default) ->
-    Default.
-get_sparse_size(#{?PAX_GNU_SPARSE_SIZE:=SparseSize}, _Default) ->
-    binary_to_integer(SparseSize);
-get_sparse_size(#{?PAX_GNU_SPARSE_REALSIZE:=SparseSize}, _Default) ->
-    binary_to_integer(SparseSize);
-get_sparse_size(_, Default) ->
-    Default.
-
 
 %% Applies all known PAX attributes to the current tar header
 -spec merge_pax(tar_header(), map()) -> tar_header().
@@ -1604,51 +1436,24 @@ parse_pax_time(Bin) when is_binary(Bin) ->
     Micro2 = Micro rem 1000000,
     calendar:now_to_datetime({Mega, Secs, Micro2}).
 
-%% Given a sparse or regular file reader, reads the whole file and
+%% Given a regular file reader, reads the whole file and
 %% parses all extended attributes it contains.
-parse_pax(#sparse_file_reader{handle=Handle,num_bytes=0}) ->
-    {#{}, Handle};
-parse_pax(#sparse_file_reader{handle=Handle0,num_bytes=NumBytes}) ->
-    case do_read(Handle0, NumBytes) of
-        {ok, Bytes, Handle1} ->
-            %% for GNU PAX sparse format 0.0 support
-            %% this function transforms the sparse format 0.0 headers
-            %% into sparse format 0.1 headers
-            do_parse_pax(Handle1, Bytes, <<>>, #{});
-        {error, _} = Err ->
-            throw(Err)
-    end;
 parse_pax(#reg_file_reader{handle=Handle,num_bytes=0}) ->
     {#{}, Handle};
 parse_pax(#reg_file_reader{handle=Handle0,num_bytes=NumBytes}) ->
     case do_read(Handle0, NumBytes) of
         {ok, Bytes, Handle1} ->
-            %% for GNU PAX sparse format 0.0 support
-            %% this function transforms the sparse format 0.0 headers
-            %% into sparse format 0.1 headers
-            do_parse_pax(Handle1, Bytes, <<>>, #{});
+            do_parse_pax(Handle1, Bytes, #{});
         {error, _} = Err ->
             throw(Err)
     end.
 
-do_parse_pax(Reader, <<>>, Sparsemap0, Headers0) when byte_size(Sparsemap0) > 0 ->
-    %% truncate comma
-    Sparsemap1 = binary_part(Sparsemap0, 0, byte_size(Sparsemap0) - 1),
-    Headers1 = maps:put(?PAX_GNU_SPARSE_MAP, Sparsemap1, Headers0),
-    {Headers1, Reader};
-do_parse_pax(Reader, <<>>, _Sparsemap, Headers) ->
+do_parse_pax(Reader, <<>>, Headers) ->
     {Headers, Reader};
-do_parse_pax(Reader, Bin, Sparsemap0, Headers) ->
+do_parse_pax(Reader, Bin, Headers) ->
     {Key, Value, Residual} = parse_pax_record(Bin),
-    if Key =:= ?PAX_GNU_SPARSE_OFFSET orelse Key =:= ?PAX_GNU_SPARSE_NUMBYTES ->
-            %% GNU sparse format 0.0 special key, write to sparse map instead of headers map
-            %% We will then later parse it as 0.1 format
-            Sparsemap1 = <<Sparsemap0/binary,Value/binary,$,>>,
-            do_parse_pax(Reader, Residual, Sparsemap1, Headers);
-       true ->
-            NewHeaders = maps:put(Key, Value, Headers),
-            do_parse_pax(Reader, Residual, Sparsemap0, NewHeaders)
-    end.
+    NewHeaders = maps:put(Key, Value, Headers),
+    do_parse_pax(Reader, Residual, NewHeaders).
 
 %% Parse an extended attribute
 parse_pax_record(Bin) when is_binary(Bin) ->
