@@ -88,8 +88,8 @@ init(_Handle, _AccessMode, _Fun) ->
 
 %%%================================================================
 %% Extracts all files from the tar file Name.
--spec extract(file:filename()) -> ok | {error, term()}.
-extract(Name) when is_list(Name) or is_binary(Name) ->
+-spec extract(open_handle()) -> ok | {error, term()}.
+extract(Name) ->
     extract(Name, []).
 
 %% Extracts (all) files from the tar file Name.
@@ -101,14 +101,21 @@ extract(Name) when is_list(Name) or is_binary(Name) ->
 %%  - {files, ListOfFilesToExtract}: Only extract ListOfFilesToExtract
 %%  - verbose: Prints verbose information about the extraction,
 %%  - {cwd, AbsoluteDir}: Sets the current working directory for the extraction
--spec extract(file:filename(), [extract_opt()]) ->
+-spec extract(open_handle(), [extract_opt()]) ->
                         ok
                      | {ok, [{string(), binary()}]}
                      | {error, term()}.
+extract({binary, Bin}, Opts) when is_list(Opts) ->
+    do_extract({binary, Bin}, Opts);
+extract({file, Fd}, Opts) when is_list(Opts) ->
+    do_extract({file, Fd}, Opts);
 extract(Name, Opts) when is_list(Name) orelse is_binary(Name), is_list(Opts) ->
+    do_extract(Name, Opts).
+
+do_extract(Handle, Opts) when is_list(Opts) ->
     Opts2 = extract_opts(Opts),
     Acc = if Opts2#read_opts.output =:= memory -> []; true -> ok end,
-    foldl_read(Name, fun extract1/4, Acc, Opts2).
+    foldl_read(Handle, fun extract1/4, Acc, Opts2).
 
 extract1(eof, Reader, _, Acc) when is_list(Acc) ->
     {ok, {ok, lists:reverse(Acc)}, Reader};
@@ -160,15 +167,15 @@ check_extract(Name, #read_opts{files=Files}) ->
                       gid()}.
 
 %% Returns a list of names of the files in the tar file Name.
--spec table(file:filename()) -> {ok, [string()]} | {error, term()}.
-table(Name) when is_list(Name) orelse is_binary(Name) ->
+-spec table(open_handle()) -> {ok, [string()]} | {error, term()}.
+table(Name) ->
     table(Name, []).
 
 %% Returns a list of names of the files in the tar file Name.
 %% Options accepted: compressed, verbose, cooked.
--spec table(file:filename(), [compressed | verbose | cooked]) ->
+-spec table(open_handle(), [compressed | verbose | cooked]) ->
                    {ok, [tar_entry()]} | {error, term()}.
-table(Name, Opts) when is_list(Name) orelse is_binary(Name), is_list(Opts) ->
+table(Name, Opts) when is_list(Opts) ->
     foldl_read(Name, fun table1/4, [], table_opts(Opts)).
 
 table1(eof, Reader, _, Result) ->
@@ -1301,7 +1308,7 @@ posix_to_erlang_time(Sec) ->
     erlang:universaltime_to_localtime(Time).
 
 foldl_read(TarName, Fun, Accu, Opts=#read_opts{})
-  when is_list(TarName) orelse is_binary(TarName), is_function(Fun,4) ->
+  when is_function(Fun,4) ->
     case catch open(TarName, [read|Opts#read_opts.open_mode]) of
         {'EXIT', Reason} ->
             {error, Reason};
