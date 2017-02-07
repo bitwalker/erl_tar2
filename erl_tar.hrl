@@ -128,7 +128,6 @@
 %% it's access, position, and the I/O primitives wrapper.
 -record(reader, {
           handle :: file:io_device() | term(),
-          output_file :: file:filename(),
           access :: read | write | ram,
           pos = 0 :: non_neg_integer(),
           func :: file_op()

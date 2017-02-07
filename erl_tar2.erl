@@ -318,10 +318,10 @@ open1({file, Fd}, read, _Raw, _Opts) ->
         {error, _} = Err ->
             Err
     end;
-open1(Name, Access, Raw, Opts) when is_list(Name); is_binary(Name) ->
+open1(Name, Access, Raw, Opts) when is_list(Name) or is_binary(Name) ->
     case file:open(Name, Raw ++ [binary, Access|Opts]) of
         {ok, File} ->
-            {ok, #reader{handle=File,output_file=Name,access=Access,func=fun file_op/2}};
+            {ok, #reader{handle=File,access=Access,func=fun file_op/2}};
         {error, Reason} ->
             {error, {Name, Reason}}
     end.
@@ -527,8 +527,6 @@ add_directory(Reader, DirName, NameInArchive, Info, Opts) ->
 
 add_files(_Reader, [], _Dir, _DirInArchive, _Opts) ->
     ok;
-add_files(Reader=#reader{output_file=Name}, [Name|Rest], Dir, DirInArchive, Opts) ->
-    add_files(Reader, Rest, Dir, DirInArchive, Opts);
 add_files(Reader, [Name|Rest], Dir, DirInArchive, #add_opts{read_info=Info}=Opts) ->
     FullName = filename:join(Dir, Name),
     NameInArchive = filename:join(DirInArchive, Name),
@@ -818,7 +816,10 @@ read_block(Reader) ->
         {ok, ?ZERO_BLOCK, Reader1} ->
             case do_read(Reader1, ?BLOCK_SIZE) of
                 eof ->
-                    throw({error, eof});
+                    % This is technically a malformed end-of-archive marker,
+                    % as two ZERO_BLOCKs are expected as the marker,
+                    % but if we've already made it this far, we should just ignore it
+                    eof;
                 {ok, ?ZERO_BLOCK, _Reader2} ->
                     eof;
                 {ok, _Block, _Reader2} ->
