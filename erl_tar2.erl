@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1997-2016. All Rights Reserved.
+%% Copyright Ericsson AB 1997-2017. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -599,7 +599,6 @@ build_header(#tar_header{}=Header, Opts) ->
        devminor=Devmin
       } = Header,
     Mtime = datetime_to_posix(Header#tar_header.mtime),
-    Xattrs = maps:to_list(Header#tar_header.xattrs),
 
     Block0 = ?ZERO_BLOCK,
     {Block1, Pax0} = write_string(Block0, ?V7_NAME, ?V7_NAME_LEN, Name, ?PAX_PATH, #{}),
@@ -620,12 +619,9 @@ build_header(#tar_header{}=Header, Opts) ->
     {Block12, Pax10} = write_numeric(Block11, ?USTAR_DEVMIN, ?USTAR_DEVMIN_LEN,
                                      Devmin, ?PAX_NONE, Pax9),
     {Block13, Pax11} = set_path(Block12, Pax10),
-    Pax12 = lists:foldl(fun ({K,V}, Acc) ->
-                                maps:put(<<?PAX_XATTR_STR,K>>, V, Acc)
-                        end, Pax11, Xattrs),
-    PaxEntry = case maps:size(Pax12) of
+    PaxEntry = case maps:size(Pax11) of
                    0 -> [];
-                   _ -> build_pax_entry(Header, Pax12, Opts)
+                   _ -> build_pax_entry(Header, Pax11, Opts)
                end,
     Block14 = set_format(Block13, ?FORMAT_USTAR),
     Block15 = set_checksum(Block14),
@@ -1374,7 +1370,7 @@ foldl_read1(Fun, Accu0, Reader0, Opts, ExtraHeaders) ->
     end.
 
 %% Applies all known PAX attributes to the current tar header
--spec merge_pax(tar_header(), map()) -> tar_header().
+-spec merge_pax(tar_header(), #{binary() => binary()}) -> tar_header().
 merge_pax(Header, ExtraHeaders) when is_map(ExtraHeaders) ->
     do_merge_pax(Header, maps:to_list(ExtraHeaders)).
 
@@ -1406,9 +1402,8 @@ do_merge_pax(Header, [{?PAX_CTIME, Ctime}|Rest]) ->
 do_merge_pax(Header, [{?PAX_SIZE, Size}|Rest]) ->
     Size2 = binary_to_integer(Size),
     do_merge_pax(Header#tar_header{size=Size2}, Rest);
-do_merge_pax(Header, [{<<?PAX_XATTR_STR, Key/binary>>, Value}|Rest]) ->
-    Xattrs2 = maps:put(Key, Value, Header#tar_header.xattrs),
-    do_merge_pax(Header#tar_header{xattrs=Xattrs2}, Rest);
+do_merge_pax(Header, [{<<?PAX_XATTR_STR, _Key/binary>>, _Value}|Rest]) ->
+    do_merge_pax(Header, Rest);
 do_merge_pax(Header, [_Ignore|Rest]) ->
     do_merge_pax(Header, Rest).
 

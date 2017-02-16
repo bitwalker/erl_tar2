@@ -1,18 +1,37 @@
+%%
+%% %CopyrightBegin%
+%%
+%% Copyright Ericsson AB 2017. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%
+%% %CopyrightEnd%
+
 %% Options used when adding files to a tar archive.
 -record(add_opts, {
-	 read_info,          % Fun to use for read file/link info.
-	 chunk_size = 0,     % For file reading when sending to sftp. 0=do not chunk
-         verbose = false}).  % Verbose on/off.
+	 read_info,          %% Fun to use for read file/link info.
+	 chunk_size = 0,     %% For file reading when sending to sftp. 0=do not chunk
+         verbose = false}).  %% Verbose on/off.
 -type add_opts() :: #add_opts{}.
 
 %% Options used when reading a tar archive.
 -record(read_opts, {
-          cwd                    :: string(),  % Current working directory.
-          keep_old_files = false :: boolean(), % Owerwrite or not.
-          files = all,                         % Set of files to extract (or all)
+          cwd                    :: string(),  %% Current working directory.
+          keep_old_files = false :: boolean(), %% Owerwrite or not.
+          files = all,                         %% Set of files to extract (or all)
           output = file :: 'file' | 'memory',
-          open_mode = [],                      % Open mode options.
-          verbose = false :: boolean()}).      % Verbose on/off.
+          open_mode = [],                      %% Open mode options.
+          verbose = false :: boolean()}).      %% Verbose on/off.
 -type read_opts() :: #read_opts{}.
 
 -type add_opt() :: dereference |
@@ -38,21 +57,20 @@
 
 %% The tar header, once fully parsed.
 -record(tar_header, {
-          name = "" :: string(),                % name of header file entry
-          mode = 8#100644 :: non_neg_integer(), % permission and mode bits
-          uid = 0 :: non_neg_integer(),         % user id of owner
-          gid = 0 :: non_neg_integer(),         % group id of owner
-          size = 0 :: non_neg_integer(),        % length in bytes
-          mtime :: calendar:datetime(),         % modified time
-          typeflag :: char(),                   % type of header entry
-          linkname = "" :: string(),            % target name of link
-          uname = "" :: string(),               % user name of owner
-          gname = "" :: string(),               % group name of owner
-          devmajor = 0 :: non_neg_integer(),    % major number of character or block device
-          devminor = 0 :: non_neg_integer(),    % minor number of character or block device
-          atime :: calendar:datetime(),         % access time
-          ctime :: calendar:datetime(),         % status change time
-          xattrs = #{} :: map()                 % extended attributes
+          name = "" :: string(),                %% name of header file entry
+          mode = 8#100644 :: non_neg_integer(), %% permission and mode bits
+          uid = 0 :: non_neg_integer(),         %% user id of owner
+          gid = 0 :: non_neg_integer(),         %% group id of owner
+          size = 0 :: non_neg_integer(),        %% length in bytes
+          mtime :: calendar:datetime(),         %% modified time
+          typeflag :: char(),                   %% type of header entry
+          linkname = "" :: string(),            %% target name of link
+          uname = "" :: string(),               %% user name of owner
+          gname = "" :: string(),               %% group name of owner
+          devmajor = 0 :: non_neg_integer(),    %% major number of character or block device
+          devminor = 0 :: non_neg_integer(),    %% minor number of character or block device
+          atime :: calendar:datetime(),         %% access time
+          ctime :: calendar:datetime()          %% status change time
          }).
 -type tar_header() :: #tar_header{}.
 
@@ -70,13 +88,13 @@
 %% A subset of tar header fields common to all tar implementations
 -record(header_v7, {
           name :: binary(),
-          mode :: binary(), % octal
-          uid :: binary(), % integer
-          gid :: binary(), % integer
-          size :: binary(), % integer
-          mtime :: binary(), % integer
-          checksum :: binary(), % integer
-          typeflag :: byte(), % char
+          mode :: binary(), %% octal
+          uid :: binary(), %% integer
+          gid :: binary(), %% integer
+          size :: binary(), %% integer
+          mtime :: binary(), %% integer
+          checksum :: binary(), %% integer
+          typeflag :: byte(), %% char
           linkname :: binary()}).
 -type header_v7() :: #header_v7{}.
 %% The set of fields specific to GNU tar formatted archives
@@ -86,12 +104,12 @@
           version :: binary(),
           uname :: binary(),
           gname :: binary(),
-          devmajor :: binary(), % integer
-          devminor :: binary(), % integer
-          atime :: binary(), % integer
-          ctime :: binary(), % integer
+          devmajor :: binary(), %% integer
+          devminor :: binary(), %% integer
+          atime :: binary(), %% integer
+          ctime :: binary(), %% integer
           sparse :: sparse_array(),
-          real_size :: binary()}). % integer
+          real_size :: binary()}). %% integer
 -type header_gnu() :: #header_gnu{}.
 %% The set of fields specific to STAR-formatted archives
 -record(header_star, {
@@ -100,11 +118,11 @@
           version :: binary(),
           uname :: binary(),
           gname :: binary(),
-          devmajor :: binary(), % integer
-          devminor :: binary(), % integer
+          devmajor :: binary(), %% integer
+          devminor :: binary(), %% integer
           prefix :: binary(),
-          atime :: binary(), % integer
-          ctime :: binary(), % integer
+          atime :: binary(), %% integer
+          ctime :: binary(), %% integer
           trailer :: binary()}).
 -type header_star() :: #header_star{}.
 %% The set of fields specific to USTAR-formatted archives
@@ -114,8 +132,8 @@
           version :: binary(),
           uname :: binary(),
           gname :: binary(),
-          devmajor :: binary(), % integer
-          devminor :: binary(), % integer
+          devmajor :: binary(), %% integer
+          devminor :: binary(), %% integer
           prefix :: binary()}).
 -type header_ustar() :: #header_ustar{}.
 
@@ -125,7 +143,7 @@
                          header_ustar().
 
 %% The overall tar reader, it holds the low-level file handle,
-%% it's access, position, and the I/O primitives wrapper.
+%% its access, position, and the I/O primitives wrapper.
 -record(reader, {
           handle :: file:io_device() | term(),
           access :: read | write | ram,
@@ -134,7 +152,7 @@
          }).
 -type reader() :: #reader{}.
 %% A reader for a regular file within the tar archive,
-%% It tracks it's current state relative to that file.
+%% It tracks its current state relative to that file.
 -record(reg_file_reader, {
           handle :: reader(),
           num_bytes = 0,
@@ -143,12 +161,12 @@
          }).
 -type reg_file_reader() :: #reg_file_reader{}.
 %% A reader for a sparse file within the tar archive,
-%% It tracks it's current state relative to that file.
+%% It tracks its current state relative to that file.
 -record(sparse_file_reader, {
           handle :: reader(),
-          num_bytes = 0, % bytes remaining
-          pos = 0, % pos
-          size = 0, % total size of file
+          num_bytes = 0, %% bytes remaining
+          pos = 0, %% pos
+          size = 0, %% total size of file
           sparse_map = #sparse_array{}
          }).
 -type sparse_file_reader() :: #sparse_file_reader{}.
@@ -157,19 +175,12 @@
 -type reader_type() :: reader() | reg_file_reader() | sparse_file_reader().
 -type handle() :: file:io_device() | term().
 
-%% Types for the I/O primitive wrapper functions
--type write_fun() :: fun((write, {handle(), iodata()}) ->
-                                ok | {error, term()}).
--type close_fun() :: fun((close, handle()) ->
-                                ok | {error, term()}).
--type read_fun() :: fun((read2, {handle(), non_neg_integer()}) ->
-                               {ok, string() | binary()} | eof | {error, term()}).
--type position_fun() :: fun((position, {file:io_device() | term, non_neg_integer()}) ->
-                                   {ok, non_neg_integer()} | {error, term()}).
--type file_op() :: write_fun()
-                 | close_fun()
-                 | read_fun()
-                 | position_fun().
+%% Type for the I/O primitive wrapper function
+-type file_op() :: fun((write | close | read2 | position,
+                       {handle(), iodata()} | handle() | {handle(), non_neg_integer()}
+                        | {handle(), non_neg_integer()}) ->
+                              ok | eof | {ok, string() | binary()} | {ok, non_neg_integer()}
+                                 | {error, term()}).
 
 %% These constants (except S_IFMT) are
 %% used to determine what type of device
@@ -180,44 +191,44 @@
 %% will not allow us to differentiate between sockets
 %% and named pipes. These constants are pulled from libc.
 -define(S_IFMT, 61440).
--define(S_IFSOCK, 49152). % socket
--define(S_FIFO, 4096).    % fifo/named pipe
--define(S_IFBLK, 24576).  % block device
--define(S_IFCHR, 8192).   % character device
+-define(S_IFSOCK, 49152). %% socket
+-define(S_FIFO, 4096).    %% fifo/named pipe
+-define(S_IFBLK, 24576).  %% block device
+-define(S_IFCHR, 8192).   %% character device
 
 %% Typeflag constants for the tar header
--define(TYPE_REGULAR, $0).         % regular file
--define(TYPE_REGULAR_A, 0).        % regular file
--define(TYPE_LINK, $1).            % hard link
--define(TYPE_SYMLINK, $2).         % symbolic link
--define(TYPE_CHAR, $3).            % character device node
--define(TYPE_BLOCK, $4).           % block device node
--define(TYPE_DIR, $5).             % directory
--define(TYPE_FIFO, $6).            % fifo node
--define(TYPE_CONT, $7).            % reserved
--define(TYPE_X_HEADER, $x).        % extended header
--define(TYPE_X_GLOBAL_HEADER, $g). % global extended header
--define(TYPE_GNU_LONGNAME, $L).    % next file has a long name
--define(TYPE_GNU_LONGLINK, $K).    % next file symlinks to a file with a long name
--define(TYPE_GNU_SPARSE, $S).      % sparse file
+-define(TYPE_REGULAR, $0).         %% regular file
+-define(TYPE_REGULAR_A, 0).        %% regular file
+-define(TYPE_LINK, $1).            %% hard link
+-define(TYPE_SYMLINK, $2).         %% symbolic link
+-define(TYPE_CHAR, $3).            %% character device node
+-define(TYPE_BLOCK, $4).           %% block device node
+-define(TYPE_DIR, $5).             %% directory
+-define(TYPE_FIFO, $6).            %% fifo node
+-define(TYPE_CONT, $7).            %% reserved
+-define(TYPE_X_HEADER, $x).        %% extended header
+-define(TYPE_X_GLOBAL_HEADER, $g). %% global extended header
+-define(TYPE_GNU_LONGNAME, $L).    %% next file has a long name
+-define(TYPE_GNU_LONGLINK, $K).    %% next file symlinks to a file with a long name
+-define(TYPE_GNU_SPARSE, $S).      %% sparse file
 
-% Mode constants from tar spec
--define(MODE_ISUID, 4000).    % set uid
--define(MODE_ISGID, 2000).    % set gid
--define(MODE_ISVTX, 1000).    % save text (sticky bit)
--define(MODE_ISDIR, 40000).   % directory
--define(MODE_ISFIFO, 10000).  % fifo
--define(MODE_ISREG, 100000).  % regular file
--define(MODE_ISLNK, 120000).  % symbolic link
--define(MODE_ISBLK, 60000).   % block special file
--define(MODE_ISCHR, 20000).   % character special file
--define(MODE_ISSOCK, 140000). % socket
+%% Mode constants from tar spec
+-define(MODE_ISUID, 4000).    %% set uid
+-define(MODE_ISGID, 2000).    %% set gid
+-define(MODE_ISVTX, 1000).    %% save text (sticky bit)
+-define(MODE_ISDIR, 40000).   %% directory
+-define(MODE_ISFIFO, 10000).  %% fifo
+-define(MODE_ISREG, 100000).  %% regular file
+-define(MODE_ISLNK, 120000).  %% symbolic link
+-define(MODE_ISBLK, 60000).   %% block special file
+-define(MODE_ISCHR, 20000).   %% character special file
+-define(MODE_ISSOCK, 140000). %% socket
 
-% Keywords for PAX extended header
+%% Keywords for PAX extended header
 -define(PAX_ATIME, <<"atime">>).
 -define(PAX_CHARSET, <<"charset">>).
 -define(PAX_COMMENT, <<"comment">>).
--define(PAX_CTIME, <<"ctime">>). % ctime is not a valid pax header
+-define(PAX_CTIME, <<"ctime">>). %% ctime is not a valid pax header
 -define(PAX_GID, <<"gid">>).
 -define(PAX_GNAME, <<"gname">>).
 -define(PAX_LINKPATH, <<"linkpath">>).
@@ -230,29 +241,29 @@
 -define(PAX_XATTR_STR, "SCHILY.xattr.").
 -define(PAX_NONE, <<"">>).
 
-% Tar format constants
-% Unknown format
+%% Tar format constants
+%% Unknown format
 -define(FORMAT_UNKNOWN, 0).
-% The format of the original Unix V7 tar tool prior to standardization
+%% The format of the original Unix V7 tar tool prior to standardization
 -define(FORMAT_V7, 1).
-% The old and new GNU formats, incompatible with USTAR.
-% This covers the old GNU sparse extension, but it does
-% not cover the GNU sparse extensions using PAX headers,
-% versions 0.0, 0.1, and 1.0; these fall under the PAX format.
+%% The old and new GNU formats, incompatible with USTAR.
+%% This covers the old GNU sparse extension, but it does
+%% not cover the GNU sparse extensions using PAX headers,
+%% versions 0.0, 0.1, and 1.0; these fall under the PAX format.
 -define(FORMAT_GNU, 2).
-% Schily's tar format, which is incompatible with USTAR.
-% This does not cover STAR extensions to the PAX format; these
-% fall under the PAX format.
+%% Schily's tar format, which is incompatible with USTAR.
+%% This does not cover STAR extensions to the PAX format; these
+%% fall under the PAX format.
 -define(FORMAT_STAR, 3).
-% USTAR is the former standardization of tar defined in POSIX.1-1988,
-% it is incompatible with the GNU and STAR formats.
+%% USTAR is the former standardization of tar defined in POSIX.1-1988,
+%% it is incompatible with the GNU and STAR formats.
 -define(FORMAT_USTAR, 4).
-% PAX is the latest standardization of tar defined in POSIX.1-2001.
-% This is an extension of USTAR and is "backwards compatible" with it.
-%
-% Some newer formats add their own extensions to PAX, such as GNU sparse
-% files and SCHILY extended attributes. Since they are backwards compatible
-% with PAX, they will be labelled as "PAX".
+%% PAX is the latest standardization of tar defined in POSIX.1-2001.
+%% This is an extension of USTAR and is "backwards compatible" with it.
+%%
+%% Some newer formats add their own extensions to PAX, such as GNU sparse
+%% files and SCHILY extended attributes. Since they are backwards compatible
+%% with PAX, they will be labelled as "PAX".
 -define(FORMAT_PAX, 5).
 
 %% Magic constants
@@ -263,9 +274,9 @@
 -define(TRAILER_STAR, <<"tar\x00">>).
 
 %% Size constants
--define(BLOCK_SIZE, 512). % size of each block in a tar stream
--define(NAME_SIZE, 100). % max length of the name field in USTAR format
--define(PREFIX_SIZE, 155). % max length of the prefix field in USTAR format
+-define(BLOCK_SIZE, 512). %% size of each block in a tar stream
+-define(NAME_SIZE, 100). %% max length of the name field in USTAR format
+-define(PREFIX_SIZE, 155). %% max length of the prefix field in USTAR format
 
 %% Maximum size of a nanosecond value as an integer
 -define(MAX_NANO_INT_SIZE, 9).
